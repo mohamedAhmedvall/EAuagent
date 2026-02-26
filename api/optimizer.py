@@ -214,24 +214,43 @@ def optimiser_plan(
         cat="Binary",
     )
 
-    # 3. Objectif
-    risk_scores = df["reduction_risque"].values
-    couts       = df["cout_renouvellement"].values
-    lngs_km     = df["LNG"].values / 1000
+    # 3. Objectif — BÉNÉFICE CUMULATIF : inciter au renouvellement précoce
+    #
+    # Renouveler le tronçon i en année t évite toutes les casses de l'année t à T-1.
+    # benefit_cum[i,t] = Σ_{s=t}^{T-1} P_casse_1an(age_i + s)
+    #
+    # → renouveler tôt (t=0) donne un bénéfice cumulé maximal (toutes les années évitées)
+    # → renouveler tard (t=T-1) ne donne qu'une seule année évitée
+    #
+    # Cela crée une incitation naturelle à traiter les tronçons critiques en priorité.
+
+    ages = df["age_actuel"].values
+    medianes = df["duree_mediane_pred"].values
+    couts    = df["cout_renouvellement"].values
+    lngs_km  = df["LNG"].values / 1000
+
+    # Matrice benefit_cum[i, t] = bénéfice cumulé sur [t, T-1] si renouvellement en année t
+    benefit = np.array([
+        [
+            sum(p_casse_1an(medianes[i], ages[i] + s) for s in range(t, T))
+            for t in range(T)
+        ]
+        for i in range(n)
+    ])
 
     if objectif == "maximiser_reduction_risque":
         prob += pulp.lpSum(
-            risk_scores[i] * x[i, t] for i in range(n) for t in range(T)
+            benefit[i, t] * x[i, t] for i in range(n) for t in range(T)
         )
     elif objectif == "minimiser_cout":
         prob += -pulp.lpSum(
             couts[i] * x[i, t] for i in range(n) for t in range(T)
         )
     else:  # equilibre
-        max_risk = max(risk_scores) * n if max(risk_scores) > 0 else 1
+        max_risk = benefit.max() * n if benefit.max() > 0 else 1
         max_cout = sum(couts) if sum(couts) > 0 else 1
         prob += pulp.lpSum(
-            (risk_scores[i] / max_risk - 0.3 * couts[i] / max_cout) * x[i, t]
+            (benefit[i, t] / max_risk - 0.3 * couts[i] / max_cout) * x[i, t]
             for i in range(n) for t in range(T)
         )
 
@@ -273,13 +292,12 @@ def optimiser_plan(
     # (évite infaisabilité MILP avec tronçons très courts)
     km_disponible_total = sum(lngs_km)
     km_min_cible = max(taux_renouv_min_km, contraintes.km_min_par_an)
-    # marge de sécurité : le grand tronçon max ne doit pas "bloquer" les autres années
-    max_single_km = max(lngs_km) if len(lngs_km) > 0 else 0
-    km_min_realisable = (km_disponible_total - max_single_km) / max(T - 1, 1)
+    # Contrainte critique : T × km_min_effectif ≤ km_disponible_total
+    # (on ne peut pas exiger par an plus que ce qu'il y a de disponible / T)
     km_min_effectif = min(
         km_min_cible,
         contraintes.km_max_par_an * 0.9,
-        km_min_realisable * 0.9,   # 10% de marge pour garantir la faisabilité MILP
+        km_disponible_total / T * 0.9,  # marge 10% pour éviter infaisabilité MILP
     )
     km_min_effectif = max(km_min_effectif, 0.0)
     for t in range(T):

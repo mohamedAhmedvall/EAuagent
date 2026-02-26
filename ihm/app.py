@@ -403,26 +403,61 @@ elif page == "🎯 Scorer un tronçon":
             st.markdown(f"### {badge}")
             st.info(result["interpretation"])
 
-            # Courbe de survie
-            st.subheader("Probabilités de survie")
-            horizons = [10, 20, 30, 50, 70]
-            probs = [result[f"P_survie_{h}ans"] for h in horizons]
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=horizons, y=probs,
-                mode="lines+markers+text",
-                text=[f"{p:.0%}" for p in probs],
-                textposition="top center",
-                line=dict(color="#2980b9", width=3),
-                marker=dict(size=10),
-            ))
-            fig.update_layout(
-                xaxis_title="Horizon (années)",
-                yaxis_title="P(survie)",
-                yaxis_range=[0, 1.05],
-                height=300, plot_bgcolor="white",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            # Courbe de survie + P_casse_1an projetée dans le temps
+            col_surv, col_haz = st.columns(2)
+
+            with col_surv:
+                st.subheader("Courbe de survie S(t)")
+                horizons = [10, 20, 30, 50, 70]
+                probs = [result[f"P_survie_{h}ans"] for h in horizons]
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=horizons, y=probs,
+                    mode="lines+markers+text",
+                    text=[f"{p:.0%}" for p in probs],
+                    textposition="top center",
+                    line=dict(color="#2980b9", width=3),
+                    marker=dict(size=10),
+                ))
+                fig.update_layout(
+                    xaxis_title="Horizon (années depuis la pose)",
+                    yaxis_title="P(survie)",
+                    yaxis_range=[0, 1.05], height=300, plot_bgcolor="white",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            with col_haz:
+                st.subheader("P(casse dans 1 an) par âge futur")
+                st.caption("Le score change d'année en année si non renouvelé")
+                med = result["duree_mediane_pred"]
+                age_base = 2026 - annee_pose
+                ages_proj = list(range(max(0, age_base - 5), age_base + 16))
+
+                def p1an_from_med(med, age):
+                    rho = RHO_WEIBULL
+                    if med <= 0 or age < 0: return 0.0
+                    lam = med / (np.log(2) ** (1.0 / rho))
+                    S = lambda t: float(np.exp(-((max(t,0)/lam)**rho))) if t > 0 else 1.0
+                    sn, ss = S(age), S(age+1)
+                    return max(0.0, min(1.0, 1 - ss/sn)) if sn > 1e-12 else 1.0
+
+                p1an_proj = [p1an_from_med(med, a) for a in ages_proj]
+                colors_haz = ["#e74c3c" if a >= age_base else "#95a5a6" for a in ages_proj]
+                fig2 = go.Figure()
+                fig2.add_trace(go.Bar(
+                    x=ages_proj, y=[p*100 for p in p1an_proj],
+                    marker_color=colors_haz,
+                    text=[f"{p:.2%}" for p in p1an_proj],
+                    textposition="outside",
+                ))
+                fig2.add_vline(x=age_base, line_dash="dash", line_color="#2c3e50",
+                               annotation_text=f"Aujourd'hui ({age_base} ans)")
+                fig2.update_layout(
+                    xaxis_title="Âge du tronçon (ans)",
+                    yaxis_title="P(casse dans 1 an) %",
+                    height=300, plot_bgcolor="white", showlegend=False,
+                )
+                st.plotly_chart(fig2, use_container_width=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -432,11 +467,34 @@ elif page == "🎯 Scorer un tronçon":
 elif page == "⚙️ Optimisation du plan":
     st.title("⚙️ Optimisation du plan de renouvellement")
 
-    st.info(
-        "Configure les contraintes puis lance l'optimisation MILP "
-        "(Programmation Linéaire en Nombres Entiers) pour obtenir un plan "
-        "pluriannuel optimal."
-    )
+    # ── Sélecteur d'horizon — mis en avant ───────────────────────────────
+    st.subheader("📅 Horizon du plan")
+    col_h1, col_h2, col_h3 = st.columns([2, 2, 3])
+
+    with col_h1:
+        horizon_choice = st.radio(
+            "Choisir l'horizon",
+            options=[1, 3, 5, 10],
+            index=2,
+            format_func=lambda x: f"{x} an{'s' if x > 1 else ''}",
+            horizontal=True,
+        )
+
+    with col_h2:
+        annee_debut = st.number_input("Année de début", 2025, 2035, 2026)
+
+    with col_h3:
+        st.markdown(f"""
+        **Ce qui change selon l'horizon :**
+        - **Scores (P_casse_1an, risk_score_50ans)** : calculés à aujourd'hui, identiques
+        - **Bénéfice du renouvellement** : dynamique — P_casse_1an(age + t) augmente avec l'âge
+          → renouveler en année 3 est évalué avec le score du tronçon en 2029
+        - **Budget total** : horizon × budget annuel = enveloppe pluriannuelle
+        - **Km traités** : plus d'horizon = plus de tronçons planifiés
+        - **Loi 1%/an** : s'applique à **chaque** année du plan
+        """)
+
+    st.divider()
 
     with st.expander("💰 Contraintes financières", expanded=True):
         col1, col2 = st.columns(2)
@@ -459,17 +517,14 @@ elif page == "⚙️ Optimisation du plan":
                                      help="La loi impose 1%/an minimum (~79 km/an)")
         lissage = st.slider("Lissage budget (variation max %)", 0, 100, 30) / 100
 
-    with st.expander("📅 Horizon du plan"):
-        col1, col2 = st.columns(2)
-        horizon = col1.number_input("Horizon (années)", 1, 20, 5)
-        annee_debut = col2.number_input("Année de début", 2025, 2035, 2026)
+    with st.expander("🎛️ Objectif & performance"):
         objectif = st.selectbox(
             "Objectif d'optimisation",
             ["maximiser_reduction_risque", "minimiser_cout", "equilibre"],
             format_func=lambda x: {
-                "maximiser_reduction_risque": "Maximiser la réduction de risque",
+                "maximiser_reduction_risque": "Maximiser la réduction de P(casse)",
                 "minimiser_cout": "Minimiser le coût total",
-                "equilibre": "Équilibre coût / risque",
+                "equilibre": "Équilibre coût / réduction de risque",
             }[x],
         )
         top_n = st.number_input(
@@ -488,7 +543,7 @@ elif page == "⚙️ Optimisation du plan":
                 "age_max_sans_renouvellement": age_max,
                 "taux_renouvellement_min_pct": taux_regul,
                 "lissage_budget_pct": lissage,
-                "horizon_plan": horizon,
+                "horizon_plan": horizon_choice,
                 "annee_debut": annee_debut,
             },
             "top_n_troncons": int(top_n) if top_n > 0 else None,
