@@ -26,6 +26,51 @@ from api.models import (
 logger = logging.getLogger(__name__)
 
 ANNEE_REF = 2026  # année courante de référence
+RHO_WEIBULL = 2.78  # paramètre de forme Weibull AFT (estimé étape 6)
+
+
+# ─── Probabilité de casse annuelle ────────────────────────────────────────
+
+def p_casse_1an(duree_mediane: float, age_actuel: float) -> float:
+    """
+    P(casse dans la prochaine année | survie jusqu'à l'âge actuel)
+
+    Formule : hazard conditionnel sur 1 an depuis la loi Weibull AFT
+      S(t) = exp(-(t / λ)^ρ)
+      λ    = duree_mediane / ln(2)^(1/ρ)     [médiane = λ · ln(2)^(1/ρ)]
+      P    = 1 - S(a+1) / S(a)
+
+    ρ = 2.78 estimé sur le dataset B (risque croissant avec l'âge).
+    """
+    if duree_mediane <= 0 or age_actuel < 0:
+        return 0.0
+    rho = RHO_WEIBULL
+    lam = duree_mediane / (np.log(2) ** (1.0 / rho))
+    if lam <= 0:
+        return 1.0
+
+    def S(t: float) -> float:
+        if t <= 0:
+            return 1.0
+        return float(np.exp(-((t / lam) ** rho)))
+
+    s_now  = S(age_actuel)
+    s_next = S(age_actuel + 1)
+    if s_now < 1e-12:
+        return 1.0           # tronçon "mort" selon le modèle
+    return max(0.0, min(1.0, 1.0 - s_next / s_now))
+
+
+def ajouter_p_casse_1an(df: pd.DataFrame) -> pd.DataFrame:
+    """Calcule P_casse_1an pour chaque tronçon et l'ajoute au DataFrame."""
+    if "P_casse_1an" not in df.columns:
+        df = df.copy()
+        df["age_actuel"] = ANNEE_REF - df["DDP_year"]
+        df["P_casse_1an"] = df.apply(
+            lambda r: p_casse_1an(r["duree_mediane_pred"], r["age_actuel"]),
+            axis=1,
+        )
+    return df
 
 
 # ─── Utilitaires ──────────────────────────────────────────────────────────
@@ -70,6 +115,7 @@ def _preparer_donnees(
 ) -> pd.DataFrame:
     """
     Prépare le DataFrame des tronçons éligibles avec :
+    - P_casse_1an   : probabilité conditionnelle de casse dans la prochaine année
     - coût estimé de renouvellement
     - âge actuel
     - flag urgence (contraint à être renouvelé)
@@ -77,6 +123,11 @@ def _preparer_donnees(
     """
     df = df.copy()
     df["age_actuel"] = ANNEE_REF - df["DDP_year"]
+
+    # ── P(casse dans la prochaine année) ─────────────────────────────────
+    # Formule Weibull AFT : P = 1 - S(a+1)/S(a)
+    # Plus actionnable qu'un score sur 50 ans pour un plan annuel.
+    df = ajouter_p_casse_1an(df)
 
     # Coût estimé par tronçon (MAD)
     df["cout_renouvellement"] = df.apply(
@@ -91,17 +142,21 @@ def _preparer_donnees(
         (df["age_actuel"] >= contraintes.age_max_sans_renouvellement)
     ).astype(int)
 
-    # Score priorité composite (pour tri initial)
+    # Score priorité composite :
+    #   50% P_casse_1an (urgence immédiate)
+    #   30% decile risque 50 ans (perspective long terme)
+    #   20% urgence flag
     df["priorite_score"] = (
-        df["risk_score_50ans"] * 0.5 +
+        df["P_casse_1an"] * 0.5 +
         (df["decile_risque"] / 10) * 0.3 +
         df["urgence"] * 0.2
     )
 
-    # Réduction de risque = risk_score_50ans (valeur à récupérer si renouvelé)
-    df["reduction_risque"] = df["risk_score_50ans"]
+    # Métrique d'utilité pour l'objectif MILP
+    # = P_casse_1an : "combien de probabilité de casse on évite cette année si on renouvelle"
+    df["reduction_risque"] = df["P_casse_1an"]
 
-    # Limiter aux N tronçons les plus risqués pour performance
+    # Limiter aux N tronçons les plus prioritaires pour performance
     if top_n is not None:
         df = df.nlargest(top_n, "priorite_score").reset_index(drop=True)
 
@@ -141,9 +196,13 @@ def optimiser_plan(
     annees = list(range(contraintes.annee_debut, contraintes.annee_debut + T))
 
     total_km_reseau = df_troncons["LNG"].sum() / 1000
+    # Contrainte réglementaire : loi impose min 1% du réseau renouvelé par an
     taux_renouv_min_km = total_km_reseau * contraintes.taux_renouvellement_min_pct / 100
 
-    logger.info(f"MILP — {n} tronçons × {T} années = {n*T} variables binaires")
+    logger.info(
+        f"MILP — {n} tronçons × {T} années = {n*T} variables binaires | "
+        f"réseau total {total_km_reseau:.0f} km | km_min réglementaire {taux_renouv_min_km:.1f} km/an"
+    )
 
     # 2. Problème PuLP
     prob = pulp.LpProblem("plan_renouvellement_somei", pulp.LpMaximize)
@@ -288,6 +347,8 @@ def optimiser_plan(
                 ))
 
     # 7. Résumé par année
+    # Construire une map GID → P_casse_1an pour le résumé annuel
+    gid_to_p1an = dict(zip(df["GID"], df["P_casse_1an"]))
     resume_par_annee: List[AnneeResume] = []
     for t, annee in enumerate(annees):
         plan_t = [p for p in plan if p.annee_prevue == annee]
@@ -296,14 +357,24 @@ def optimiser_plan(
             nb_troncons=len(plan_t),
             km_renouveles=sum(p.LNG_km for p in plan_t),
             budget_engage=sum(p.cout_estime for p in plan_t),
-            reduction_risque_totale=sum(p.risk_score_50ans for p in plan_t),
+            reduction_risque_totale=sum(gid_to_p1an.get(p.GID, 0) for p in plan_t),
         ))
 
     # 8. Résumé global
     gids_planifies = {p.GID for p in plan}
     n_non_planifies = len(df) - len(plan)
-    risque_total = df["risk_score_50ans"].sum()
-    risque_reduit = sum(p.risk_score_50ans for p in plan)
+
+    # Métriques P_casse_1an (objectif principal)
+    p_casse_total  = df["P_casse_1an"].sum()
+    p_casse_reduit = df.loc[df["GID"].isin(gids_planifies), "P_casse_1an"].sum()
+    p_casse_residuel_pct = (
+        (p_casse_total - p_casse_reduit) / p_casse_total * 100
+        if p_casse_total > 0 else 0.0
+    )
+
+    # Métriques risk_score_50ans (perspective long terme)
+    risque_total  = df["risk_score_50ans"].sum()
+    risque_reduit = df.loc[df["GID"].isin(gids_planifies), "risk_score_50ans"].sum()
     risque_residuel_pct = (
         (risque_total - risque_reduit) / risque_total * 100
         if risque_total > 0 else 0.0
@@ -313,8 +384,13 @@ def optimiser_plan(
         "nb_troncons_planifies": len(plan),
         "nb_troncons_total_eligible": n,
         "km_total_renouveles": round(sum(p.LNG_km for p in plan), 2),
+        "km_min_reglementaire_par_an": round(taux_renouv_min_km, 1),
         "budget_total_engage": round(sum(p.cout_estime for p in plan), 0),
-        "reduction_risque_totale": round(risque_reduit, 2),
+        # Objectif principal : P_casse_1an évitée
+        "p_casse_1an_evitee": round(p_casse_reduit, 4),
+        "p_casse_1an_residuelle_pct": round(p_casse_residuel_pct, 2),
+        # Perspective long terme
+        "reduction_risque_50ans": round(risque_reduit, 2),
         "risque_residuel_pct": round(risque_residuel_pct, 2),
         "pct_urgences_traites": round(
             len([p for p in plan if df.loc[df["GID"] == p.GID, "urgence"].values[0] == 1

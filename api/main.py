@@ -131,20 +131,30 @@ def racine():
 @app.get("/stats", tags=["Réseau"])
 def statistiques_reseau():
     """Statistiques globales du réseau scoré."""
-    df = _load_scoring()
+    from api.optimizer import ajouter_p_casse_1an
+    df = ajouter_p_casse_1an(_load_scoring())
     age_actuel = 2026 - df["DDP_year"]
 
     dist_deciles = df["decile_risque"].value_counts().sort_index().to_dict()
     dist_mat     = df["MAT_grp"].value_counts().to_dict()
+    total_km     = df["LNG"].sum() / 1000
 
     return {
         "total_troncons": int(len(df)),
-        "total_km": round(df["LNG"].sum() / 1000, 1),
+        "total_km": round(total_km, 1),
+        "km_min_reglementaire_par_an": round(total_km * 1.0 / 100, 1),  # loi 1%/an
         "age_moyen_ans": round(float(age_actuel.mean()), 1),
         "age_median_ans": round(float(age_actuel.median()), 1),
         "pct_top10_risque": round(df["top10_pourcent"].mean() * 100, 1),
         "nb_fuites_actives": int((df["nb_fuites_detectees"] >= 1).sum()),
         "nb_materiaux_urgence_FTVI": int((df["MAT_grp"] == "FTVI").sum()),
+        # P_casse_1an — probabilité de casse dans la prochaine année
+        "p_casse_1an_moyen": round(float(df["P_casse_1an"].mean()), 6),
+        "p_casse_1an_median": round(float(df["P_casse_1an"].median()), 6),
+        "p_casse_1an_p90": round(float(df["P_casse_1an"].quantile(0.9)), 6),
+        "nb_troncons_p_casse_1an_gt_1pct": int((df["P_casse_1an"] >= 0.01).sum()),
+        "nb_troncons_p_casse_1an_gt_5pct": int((df["P_casse_1an"] >= 0.05).sum()),
+        # risk_score_50ans — perspective long terme
         "distribution_deciles": {str(k): int(v) for k, v in dist_deciles.items()},
         "distribution_materiaux": {str(k): int(v) for k, v in dist_mat.items()},
         "risk_score_moyen": round(float(df["risk_score_50ans"].mean()), 4),
@@ -239,6 +249,11 @@ def scorer_troncon(req: ScoreRequest):
         surv[h] = float(sf.iloc[0, 0])
 
     risk_score = 1 - surv[50]
+    age_actuel = 2026 - req.DDP_year
+
+    # P(casse dans la prochaine année | survie jusqu'à aujourd'hui)
+    from api.optimizer import p_casse_1an as _p1an
+    p1an = _p1an(median_pred, age_actuel)
 
     # Décile (relativement au scoring global)
     df_score = _load_scoring()
@@ -249,18 +264,19 @@ def scorer_troncon(req: ScoreRequest):
         include_lowest=True,
     )[0])
 
-    # Interprétation
-    if risk_score >= df_score["risk_score_50ans"].quantile(0.9):
-        interpretation = "CRITIQUE — renouvellement prioritaire (top 10%)"
-    elif risk_score >= df_score["risk_score_50ans"].quantile(0.7):
-        interpretation = "ÉLEVÉ — à surveiller et planifier"
-    elif risk_score >= df_score["risk_score_50ans"].quantile(0.4):
-        interpretation = "MODÉRÉ — planification moyen terme"
+    # Interprétation basée sur P_casse_1an (plus pertinente pour l'action immédiate)
+    if p1an >= 0.05:
+        interpretation = f"CRITIQUE — P(casse cette année) = {p1an:.1%} → renouvellement immédiat"
+    elif p1an >= 0.01:
+        interpretation = f"ÉLEVÉ — P(casse cette année) = {p1an:.1%} → à planifier sous 2 ans"
+    elif p1an >= 0.001:
+        interpretation = f"MODÉRÉ — P(casse cette année) = {p1an:.1%} → planification 3-5 ans"
     else:
-        interpretation = "FAIBLE — maintien en service"
+        interpretation = f"FAIBLE — P(casse cette année) = {p1an:.2%} → maintien en service"
 
     return ScoreResponse(
         duree_mediane_pred=round(median_pred, 1),
+        P_casse_1an=round(p1an, 6),
         risk_score_50ans=round(risk_score, 4),
         P_survie_10ans=round(surv[10], 4),
         P_survie_20ans=round(surv[20], 4),

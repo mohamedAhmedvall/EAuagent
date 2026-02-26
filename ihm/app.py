@@ -61,11 +61,33 @@ st.markdown("""
 
 # ─── Fonctions utilitaires ────────────────────────────────────────────────
 
+RHO_WEIBULL = 2.78
+
 @st.cache_data(ttl=600)
 def charger_scoring() -> pd.DataFrame:
-    """Chargement direct du CSV (fallback si API indisponible)."""
+    """Chargement direct du CSV + calcul P_casse_1an."""
     df = pd.read_csv(SCORE_CSV)
     df["age_actuel"] = 2026 - df["DDP_year"]
+
+    # P(casse dans la prochaine année | survie jusqu'à aujourd'hui)
+    def _p1an(row):
+        med = row["duree_mediane_pred"]
+        age = row["age_actuel"]
+        if med <= 0 or age < 0:
+            return 0.0
+        rho = RHO_WEIBULL
+        lam = med / (np.log(2) ** (1.0 / rho))
+        if lam <= 0:
+            return 1.0
+        def S(t):
+            return float(np.exp(-((max(t, 0) / lam) ** rho))) if t > 0 else 1.0
+        s_now = S(age)
+        s_next = S(age + 1)
+        if s_now < 1e-12:
+            return 1.0
+        return max(0.0, min(1.0, 1.0 - s_next / s_now))
+
+    df["P_casse_1an"] = df.apply(_p1an, axis=1)
     return df
 
 
@@ -95,11 +117,12 @@ def couleur_decile(d):
     else:        return "#27ae60"
 
 
-def badge_risque(score):
-    if score >= 0.7:  return "🔴 CRITIQUE"
-    elif score >= 0.5: return "🟠 ÉLEVÉ"
-    elif score >= 0.3: return "🟡 MODÉRÉ"
-    else:              return "🟢 FAIBLE"
+def badge_risque(p1an: float) -> str:
+    """Badge basé sur P_casse_1an (probabilité de casse dans la prochaine année)."""
+    if p1an >= 0.05:   return "🔴 CRITIQUE  (P≥5%/an)"
+    elif p1an >= 0.01: return "🟠 ÉLEVÉ     (P≥1%/an)"
+    elif p1an >= 0.001:return "🟡 MODÉRÉ    (P≥0.1%/an)"
+    else:              return "🟢 FAIBLE    (P<0.1%/an)"
 
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────
@@ -136,13 +159,15 @@ if page == "📊 Tableau de bord":
     st.title("📊 Tableau de bord du réseau")
 
     df = charger_scoring()
+    total_km = df["LNG"].sum() / 1000
+    km_min_loi = total_km * 1.0 / 100  # 1% réglementaire
 
-    # KPIs
+    # KPIs ligne 1
     col1, col2, col3, col4, col5 = st.columns(5)
     kpis = [
         ("Tronçons", f"{len(df):,}", "Total analysés"),
-        ("Réseau", f"{df['LNG'].sum()/1000:.0f} km", "Longueur totale"),
-        ("Âge moyen", f"{(2026-df['DDP_year']).mean():.0f} ans", "Du réseau"),
+        ("Réseau", f"{total_km:.0f} km", "Longueur totale"),
+        ("Min légal/an", f"{km_min_loi:.0f} km", "Loi : 1%/an obligatoire"),
         ("Top 10% risque", f"{df['top10_pourcent'].sum():,}", "Tronçons prioritaires"),
         ("Fuites actives", f"{(df['nb_fuites_detectees']>=1).sum():,}", "Tronçons avec fuites"),
     ]
@@ -153,6 +178,18 @@ if page == "📊 Tableau de bord":
               <div class="metric-value">{val}</div>
               <div class="metric-label">{label}<br><small>{sub}</small></div>
             </div>""", unsafe_allow_html=True)
+
+    # KPIs P_casse_1an ligne 2
+    st.divider()
+    st.subheader("Probabilité de casse dans la prochaine année — P_casse_1an")
+    st.caption("Hazard conditionnel Weibull AFT : P(casse dans [age, age+1] | survie jusqu'à aujourd'hui)")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("P_casse_1an moyen", f"{df['P_casse_1an'].mean():.4%}")
+    c2.metric("P_casse_1an médian", f"{df['P_casse_1an'].median():.4%}")
+    c3.metric("Tronçons P≥1%/an", f"{(df['P_casse_1an']>=0.01).sum():,}",
+              help="Priorité ÉLEVÉE ou CRITIQUE")
+    c4.metric("Tronçons P≥5%/an", f"{(df['P_casse_1an']>=0.05).sum():,}",
+              help="Priorité CRITIQUE — renouvellement immédiat")
 
     st.divider()
 
@@ -262,43 +299,48 @@ elif page == "🔍 Explorer les tronçons":
     if fuites_only:
         filtered = filtered[filtered["nb_fuites_detectees"] >= 1]
 
-    filtered = filtered.sort_values("risk_score_50ans", ascending=False)
+    filtered = filtered.sort_values("P_casse_1an", ascending=False)
 
-    st.caption(f"**{len(filtered):,}** tronçons correspondent aux filtres")
+    st.caption(f"**{len(filtered):,}** tronçons — triés par P_casse_1an (priorité annuelle)")
 
-    # Affichage tableau
+    # Affichage tableau avec P_casse_1an en premier
     cols_affich = ["GID", "MAT_grp", "DIAMETRE_imp", "LNG", "age_actuel",
-                   "risk_score_50ans", "decile_risque", "nb_fuites_detectees",
-                   "nb_anomalies", "duree_mediane_pred"]
+                   "P_casse_1an", "risk_score_50ans", "decile_risque",
+                   "nb_fuites_detectees", "nb_anomalies", "duree_mediane_pred"]
     cols_ok = [c for c in cols_affich if c in filtered.columns]
 
     df_display = filtered[cols_ok].copy()
-    df_display.columns = [
-        "GID", "Matériau", "Diamètre (mm)", "Longueur (m)", "Âge (ans)",
-        "Score risque", "Décile", "Fuites détectées", "Anomalies", "Durée médiane (ans)"
-    ][:len(cols_ok)]
+    rename_map = {
+        "GID": "GID", "MAT_grp": "Matériau", "DIAMETRE_imp": "Diamètre (mm)",
+        "LNG": "Longueur (m)", "age_actuel": "Âge (ans)",
+        "P_casse_1an": "P(casse/an) ★",
+        "risk_score_50ans": "Score 50 ans", "decile_risque": "Décile",
+        "nb_fuites_detectees": "Fuites détectées",
+        "nb_anomalies": "Anomalies", "duree_mediane_pred": "Durée médiane (ans)",
+    }
+    df_display = df_display.rename(columns={k: v for k, v in rename_map.items() if k in df_display.columns})
 
+    grad_cols = [c for c in ["P(casse/an) ★", "Score 50 ans"] if c in df_display.columns]
     st.dataframe(
-        df_display.head(500).style.background_gradient(
-            subset=["Score risque"] if "Score risque" in df_display.columns else [],
-            cmap="RdYlGn_r",
-        ),
+        df_display.head(500).style.background_gradient(subset=grad_cols[:1], cmap="RdYlGn_r")
+                  .format({c: "{:.4%}" for c in ["P(casse/an) ★"] if c in df_display.columns}),
         use_container_width=True,
         height=400,
     )
 
-    # Scatterplot risque vs âge
-    st.subheader("Score de risque vs Âge du tronçon")
+    # Scatter P_casse_1an vs âge
+    st.subheader("P(casse prochaine année) vs Âge du tronçon")
     fig = px.scatter(
         filtered.sample(min(3000, len(filtered))),
-        x="age_actuel", y="risk_score_50ans",
+        x="age_actuel", y="P_casse_1an",
         color="MAT_grp", size="DIAMETRE_imp",
-        hover_data=["GID", "LNG", "decile_risque"],
+        hover_data=["GID", "LNG", "decile_risque", "risk_score_50ans"],
         opacity=0.6,
-        labels={"age_actuel": "Âge (ans)", "risk_score_50ans": "Score risque 50 ans"},
+        labels={"age_actuel": "Âge (ans)", "P_casse_1an": "P(casse dans 1 an)"},
         color_discrete_sequence=px.colors.qualitative.Bold,
     )
-    fig.update_layout(height=400, plot_bgcolor="white")
+    fig.update_layout(height=400, plot_bgcolor="white",
+                      yaxis_tickformat=".2%")
     st.plotly_chart(fig, use_container_width=True)
 
     # Export
@@ -347,12 +389,17 @@ elif page == "🎯 Scorer un tronçon":
             st.error(f"Erreur API : {err}\n\nVérifiez que l'API est démarrée : `uvicorn api.main:app --reload`")
         else:
             st.divider()
-            col_r1, col_r2, col_r3 = st.columns(3)
-            col_r1.metric("Score de risque (50 ans)", f"{result['risk_score_50ans']:.3f}")
+            # Métrique principale : P_casse_1an
+            p1an = result.get("P_casse_1an", 0)
+            col0, col_r1, col_r2, col_r3 = st.columns(4)
+            col0.metric("P(casse cette année) ★",
+                        f"{p1an:.3%}",
+                        help="Probabilité conditionnelle de casse dans la prochaine année")
+            col_r1.metric("Score risque 50 ans", f"{result['risk_score_50ans']:.3f}")
             col_r2.metric("Durée médiane prédite", f"{result['duree_mediane_pred']:.1f} ans")
             col_r3.metric("Décile de risque", f"{result['decile_risque']}/10")
 
-            badge = badge_risque(result["risk_score_50ans"])
+            badge = badge_risque(p1an)
             st.markdown(f"### {badge}")
             st.info(result["interpretation"])
 
@@ -398,15 +445,18 @@ elif page == "⚙️ Optimisation du plan":
 
     with st.expander("🏗️ Contraintes opérationnelles"):
         col1, col2 = st.columns(2)
-        km_max = col1.number_input("Km max renouvelables/an", 10, 500, 80)
-        km_min = col2.number_input("Km min/an (taux cible)", 0, 100, 10)
+        km_max = col1.number_input("Km max renouvelables/an", 10, 500, 150)
+        km_min = col2.number_input("Km min/an (taux cible opérationnel)", 0, 200, 10)
         chantiers_max = st.number_input("Chantiers simultanés max", 1, 100, 10)
+        st.caption("ℹ️ La loi impose en plus un minimum de **1%/an** (~79 km/an sur 7920 km), "
+                   "défini dans 'Taux réglementaire' ci-dessous.")
 
     with st.expander("🎯 Priorisation & réglementaire"):
         col1, col2 = st.columns(2)
         decile_prio = col1.slider("Décile prioritaire min", 1, 10, 7)
         age_max = col2.number_input("Age max sans renouvellement (ans)", 30, 120, 60)
-        taux_regul = st.number_input("Taux min réglementaire (%/an)", 0.0, 10.0, 1.5, step=0.1)
+        taux_regul = st.number_input("Taux min réglementaire (%/an)", 0.0, 10.0, 1.0, step=0.1,
+                                     help="La loi impose 1%/an minimum (~79 km/an)")
         lissage = st.slider("Lissage budget (variation max %)", 0, 100, 30) / 100
 
     with st.expander("📅 Horizon du plan"):
@@ -454,11 +504,15 @@ elif page == "⚙️ Optimisation du plan":
             st.success(f"✅ {result['message']}")
 
             g = result["resume_global"]
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Tronçons planifiés", f"{g.get('nb_troncons_planifies',0):,}")
-            col2.metric("Km renouvelés", f"{g.get('km_total_renouveles',0):.1f} km")
+            col2.metric("Km renouvelés", f"{g.get('km_total_renouveles',0):.1f} km",
+                        delta=f"min légal {g.get('km_min_reglementaire_par_an',0):.0f} km/an")
             col3.metric("Budget total", f"{g.get('budget_total_engage',0)/1e6:.1f} M MAD")
-            col4.metric("Risque résiduel", f"{g.get('risque_residuel_pct',100):.1f}%")
+            col4.metric("P(casse/an) évitée ★",
+                        f"{g.get('p_casse_1an_evitee',0):.3f}",
+                        help="Somme des P_casse_1an des tronçons planifiés")
+            col5.metric("Risque résiduel (50 ans)", f"{g.get('risque_residuel_pct',100):.1f}%")
 
             # Résumé par année
             st.subheader("Plan annuel")

@@ -49,6 +49,7 @@ class TronconScored(TronconBase):
     decile_risque: int
     top10_pourcent: int
     age_actuel: Optional[float] = None
+    P_casse_1an: Optional[float] = None      # P(casse prochaine année | survie jusqu'à aujourd'hui)
     cout_renouvellement_estime: Optional[float] = None  # MAD
 
 class TronconDetail(TronconScored):
@@ -74,6 +75,7 @@ class ScoreRequest(BaseModel):
 
 class ScoreResponse(BaseModel):
     duree_mediane_pred: float
+    P_casse_1an: float               # P(casse prochaine année | survie jusqu'à aujourd'hui)
     risk_score_50ans: float
     P_survie_10ans: float
     P_survie_20ans: float
@@ -116,7 +118,7 @@ class ContraintesOptimisation(BaseModel):
     materiaux_urgence: List[str] = Field(default=["FTVI", "AC"], description="Matériaux à renouveler en priorité absolue")
 
     # Réglementaire
-    taux_renouvellement_min_pct: float = Field(1.5, description="Taux min annuel imposé par régulateur (%)")
+    taux_renouvellement_min_pct: float = Field(1.0, description="Taux min annuel imposé par la loi (%) — 1% obligatoire")
 
     # Planning
     horizon_plan: int = Field(5, ge=1, le=20, description="Horizon du plan (années)")
