@@ -137,7 +137,8 @@ with st.sidebar:
     page = st.radio(
         "Navigation",
         ["📊 Tableau de bord", "🔍 Explorer les tronçons",
-         "🎯 Scorer un tronçon", "⚙️ Optimisation du plan", "🔄 Analyse What-If"],
+         "🎯 Scorer un tronçon", "⚙️ Optimisation du plan", "🔄 Analyse What-If",
+         "🧠 Comparaison & Explicabilité"],
         label_visibility="collapsed",
     )
 
@@ -785,3 +786,515 @@ elif page == "🔄 Analyse What-If":
                 )
                 fig.update_layout(height=350)
                 st.plotly_chart(fig, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PAGE 6 — Comparaison & Explicabilité
+# ═══════════════════════════════════════════════════════════════════════════
+
+elif page == "🧠 Comparaison & Explicabilité":
+    st.title("🧠 Comparaison des stratégies & Explicabilité")
+    st.caption(
+        "Comparez l'optimiseur MILP avec deux baselines (glouton et aléatoire). "
+        "Découvrez pourquoi chaque tronçon a été sélectionné et visualisez la frontière Pareto."
+    )
+
+    # ── Coûts MAD/km par matériau (identiques à l'API) ────────────────────
+    _COUT_KM = {
+        "FT": 8_000_000, "FTG": 7_500_000, "FTVI": 8_500_000,
+        "PEHD": 6_000_000, "PVC": 5_500_000, "BTM": 7_000_000,
+        "POLY": 6_500_000, "AC": 9_000_000,
+    }
+    _URGENCE_MATS = {"FTVI", "AC"}
+
+    # ── Helpers locaux ────────────────────────────────────────────────────
+    def _p1an_loc(med, age):
+        if med <= 0 or age < 0:
+            return 0.0
+        rho = RHO_WEIBULL
+        lam = med / (np.log(2) ** (1.0 / rho))
+        if lam <= 0:
+            return 1.0
+        def S(t): return float(np.exp(-((max(t, 0) / lam) ** rho))) if t > 0 else 1.0
+        sn, ss = S(age), S(age + 1)
+        return max(0.0, min(1.0, 1.0 - ss / sn)) if sn > 1e-12 else 1.0
+
+    def _enrichir(df):
+        d = df.copy()
+        d["age_actuel"] = 2026 - d["DDP_year"]
+        if "P_casse_1an" not in d.columns:
+            d["P_casse_1an"] = d.apply(
+                lambda r: _p1an_loc(r["duree_mediane_pred"], r["age_actuel"]), axis=1
+            )
+        d["cout_renouvellement"] = d.apply(
+            lambda r: _COUT_KM.get(r["MAT_grp"], 7_000_000) * r["LNG"] / 1000, axis=1
+        )
+        d["urgence"] = d["MAT_grp"].isin(_URGENCE_MATS).astype(int)
+        d["age_ratio"] = d["age_actuel"] / d["duree_mediane_pred"].clip(lower=1)
+        d["efficience"] = d["P_casse_1an"] / (d["cout_renouvellement"].clip(lower=1e3) / 1e6)
+        return d
+
+    def _greedy(d, budget_tot, km_tot):
+        """Sélection par P_casse_1an décroissant jusqu'à saturation budget/km."""
+        bu, ku, sel = 0.0, 0.0, []
+        for _, row in d.sort_values("P_casse_1an", ascending=False).iterrows():
+            c = row["cout_renouvellement"]
+            k = row["LNG"] / 1000
+            if bu + c <= budget_tot and ku + k <= km_tot:
+                sel.append(row)
+                bu += c
+                ku += k
+        return pd.DataFrame(sel) if sel else pd.DataFrame(columns=d.columns), bu, ku
+
+    def _random_avg(d, budget_tot, km_tot, n_runs=10):
+        """Moyenne de n_runs sélections aléatoires."""
+        stats = []
+        for seed in range(n_runs):
+            d2 = d.sample(frac=1, random_state=seed)
+            bu, ku, sel = 0.0, 0.0, []
+            for _, row in d2.iterrows():
+                c = row["cout_renouvellement"]
+                k = row["LNG"] / 1000
+                if bu + c <= budget_tot and ku + k <= km_tot:
+                    sel.append(row)
+                    bu += c
+                    ku += k
+            sub = pd.DataFrame(sel) if sel else pd.DataFrame(columns=d.columns)
+            stats.append({
+                "nb":         len(sub),
+                "km":         sub["LNG"].sum() / 1000 if len(sub) > 0 else 0.0,
+                "budget":     bu,
+                "p_casse":    sub["P_casse_1an"].sum() if len(sub) > 0 else 0.0,
+                "urgence_pct": sub["urgence"].mean() * 100 if len(sub) > 0 else 0.0,
+            })
+        return pd.DataFrame(stats).mean()
+
+    # ── Configuration ─────────────────────────────────────────────────────
+    st.subheader("Configuration")
+    col1, col2, col3, col4 = st.columns(4)
+    b_max_yr   = col1.number_input("Budget annuel max (M MAD)", 50, 5000, 500, key="b6") * 1_000_000
+    km_max_yr  = col2.number_input("Km max/an", 10, 500, 150, key="km6")
+    top_n6     = int(col3.number_input("Top N tronçons analysés", 500, 20000, 5000, key="tn6"))
+    horizon6   = col4.radio("Horizon (MILP)", [1, 3, 5], index=1, horizontal=True, key="h6")
+
+    st.caption(
+        f"Enveloppe totale : **{b_max_yr/1e6:.0f} M MAD/an × {horizon6} ans = "
+        f"{b_max_yr/1e6*horizon6:.0f} M MAD** | "
+        f"**{km_max_yr} km/an × {horizon6} ans = {km_max_yr*horizon6} km**  "
+        "_(glouton et aléatoire utilisent ces totaux sans contrainte annuelle)_"
+    )
+
+    if st.button("▶️ Lancer la comparaison des 3 stratégies", use_container_width=True, type="primary", key="run6"):
+
+        df_all6 = charger_scoring()
+        df_enr6 = _enrichir(df_all6)
+        df_top6 = df_enr6.nlargest(top_n6, "P_casse_1an").copy().reset_index(drop=True)
+
+        budget_tot = b_max_yr * horizon6
+        km_tot     = km_max_yr * horizon6
+
+        # ── 1. Glouton ────────────────────────────────────────────────────
+        with st.spinner("Stratégie glouton …"):
+            df_glou6, glou_budget, _glou_km = _greedy(df_top6, budget_tot, km_tot)
+        glou_nb  = len(df_glou6)
+        glou_km  = df_glou6["LNG"].sum() / 1000 if glou_nb > 0 else 0.0
+        glou_p   = df_glou6["P_casse_1an"].sum() if glou_nb > 0 else 0.0
+        glou_urg = df_glou6["urgence"].mean() * 100 if glou_nb > 0 else 0.0
+
+        # ── 2. Aléatoire (10 runs) ────────────────────────────────────────
+        with st.spinner("Stratégie aléatoire — 10 tirages …"):
+            rnd = _random_avg(df_top6, budget_tot, km_tot)
+
+        # ── 3. MILP via API ────────────────────────────────────────────────
+        with st.spinner("Optimiseur MILP (API) …"):
+            milp_payload = {
+                "contraintes": {
+                    "budget_annuel_max":         b_max_yr,
+                    "budget_annuel_min":          0,
+                    "km_max_par_an":              km_max_yr,
+                    "km_min_par_an":              0,
+                    "taux_renouvellement_min_pct": 0,
+                    "lissage_budget_pct":          0,
+                    "horizon_plan":               horizon6,
+                    "annee_debut":                2026,
+                },
+                "top_n_troncons": top_n6,
+                "objectif":       "maximiser_reduction_risque",
+            }
+            milp_res6, err6 = api_post("/optimiser", milp_payload)
+
+        if err6 or not milp_res6:
+            milp_ok6 = False
+            st.warning(f"API MILP indisponible : {err6}")
+            milp_nb = milp_km = milp_budget = milp_p = milp_urg = 0.0
+            plan_det6 = []
+        else:
+            milp_ok6 = True
+            g6 = milp_res6.get("resume_global", {})
+            milp_nb     = g6.get("nb_troncons_planifies", 0)
+            milp_km     = g6.get("km_total_renouveles", 0.0)
+            milp_budget = g6.get("budget_total_engage", 0.0)
+            milp_p      = g6.get("p_casse_1an_evitee", 0.0)
+            plan_det6   = milp_res6.get("plan_detaille", [])
+            df_plan6    = pd.DataFrame(plan_det6) if plan_det6 else pd.DataFrame()
+            milp_urg    = df_plan6["MAT_grp"].isin(_URGENCE_MATS).mean() * 100 if len(df_plan6) > 0 else 0.0
+
+        # ══════════════════════════════════════════════════════════════════
+        # A — BENCHMARK
+        # ══════════════════════════════════════════════════════════════════
+        st.divider()
+        st.subheader("A — Benchmark : MILP ⚡ vs Glouton 📋 vs Aléatoire 🎲")
+
+        # Cartes colorées
+        ca, cb, cc = st.columns(3)
+        def _carte(col, titre, nb, km, bud_m, p, urg, bg):
+            col.markdown(f"""
+            <div style="background:{bg};border-radius:12px;padding:18px;color:white;text-align:center">
+              <h4 style="margin:0 0 8px">{titre}</h4>
+              <span style="font-size:1.6rem;font-weight:bold">{p:.3f}</span><br>
+              <span style="font-size:0.8rem">Σ P(casse/an) évitée</span><br><br>
+              <b>{nb:,.0f}</b> tronçons &nbsp;·&nbsp; <b>{km:.1f} km</b><br>
+              Budget engagé : <b>{bud_m:.1f} M MAD</b><br>
+              % urgences (FTVI/AC) : <b>{urg:.0f}%</b>
+            </div>""", unsafe_allow_html=True)
+
+        _carte(ca, "🎲 Aléatoire",           rnd["nb"], rnd["km"], rnd["budget"]/1e6, rnd["p_casse"], rnd["urgence_pct"], "#7f8c8d")
+        _carte(cb, "📋 Glouton (tri score)",  glou_nb,   glou_km,  glou_budget/1e6,   glou_p,        glou_urg,           "#2980b9")
+        if milp_ok6:
+            _carte(cc, "⚡ MILP (optimal)",   milp_nb,   milp_km,  milp_budget/1e6,   milp_p,        milp_urg,           "#27ae60")
+        else:
+            cc.warning("MILP indisponible")
+
+        # Bar chart comparatif
+        strats   = ["Aléatoire", "Glouton"]
+        p_vals   = [rnd["p_casse"], glou_p]
+        clrs     = ["#95a5a6", "#2980b9"]
+        bud_vals = [rnd["budget"] / 1e6, glou_budget / 1e6]
+        if milp_ok6:
+            strats.append("MILP")
+            p_vals.append(milp_p)
+            clrs.append("#27ae60")
+            bud_vals.append(milp_budget / 1e6)
+
+        fig_b = go.Figure()
+        fig_b.add_bar(
+            x=strats, y=p_vals, marker_color=clrs,
+            text=[f"{v:.3f}" for v in p_vals], textposition="outside",
+            name="P(casse/an) évitée", yaxis="y",
+        )
+        fig_b.add_trace(go.Scatter(
+            x=strats, y=bud_vals, mode="lines+markers",
+            name="Budget engagé (M MAD)", line=dict(color="#e67e22", dash="dot", width=2),
+            marker=dict(size=10), yaxis="y2",
+        ))
+        if milp_ok6 and rnd["p_casse"] > 1e-9:
+            gain_rnd  = (milp_p - rnd["p_casse"]) / rnd["p_casse"] * 100
+            gain_glou = (milp_p - glou_p)         / max(glou_p, 1e-9) * 100
+            fig_b.add_annotation(
+                x="MILP", y=milp_p,
+                text=f"<b>+{gain_rnd:.0f}%</b> vs aléatoire<br>+{gain_glou:.0f}% vs glouton",
+                showarrow=True, arrowhead=2, yshift=40,
+                font=dict(color="#27ae60", size=13), bgcolor="white",
+                bordercolor="#27ae60", borderwidth=1,
+            )
+        fig_b.update_layout(
+            title="Réduction de risque par stratégie (même enveloppe budget/km)",
+            yaxis=dict(title="Σ P_casse_1an évitée"),
+            yaxis2=dict(title="Budget engagé (M MAD)", overlaying="y", side="right",
+                        titlefont=dict(color="#e67e22")),
+            height=400, plot_bgcolor="white", showlegend=True,
+            legend=dict(x=0.01, y=0.99),
+        )
+        st.plotly_chart(fig_b, use_container_width=True)
+
+        # Tableau synthèse
+        rows_b = [
+            {
+                "Stratégie":              "🎲 Aléatoire (moy. 10 tirages)",
+                "Tronçons":               int(rnd["nb"]),
+                "Km":                     round(rnd["km"], 1),
+                "Budget (M MAD)":         round(rnd["budget"] / 1e6, 1),
+                "P(casse/an) évitée":     round(rnd["p_casse"], 4),
+                "% Urgences":             round(rnd["urgence_pct"], 0),
+                "Coût / P évitée (M MAD)": round(rnd["budget"] / 1e6 / max(rnd["p_casse"], 1e-9), 1),
+            },
+            {
+                "Stratégie":              "📋 Glouton (tri P_casse_1an)",
+                "Tronçons":               glou_nb,
+                "Km":                     round(glou_km, 1),
+                "Budget (M MAD)":         round(glou_budget / 1e6, 1),
+                "P(casse/an) évitée":     round(glou_p, 4),
+                "% Urgences":             round(glou_urg, 0),
+                "Coût / P évitée (M MAD)": round(glou_budget / 1e6 / max(glou_p, 1e-9), 1),
+            },
+        ]
+        if milp_ok6:
+            rows_b.append({
+                "Stratégie":              "⚡ MILP (optimiseur mixte entier)",
+                "Tronçons":               milp_nb,
+                "Km":                     round(milp_km, 1),
+                "Budget (M MAD)":         round(milp_budget / 1e6, 1),
+                "P(casse/an) évitée":     round(milp_p, 4),
+                "% Urgences":             round(milp_urg, 0),
+                "Coût / P évitée (M MAD)": round(milp_budget / 1e6 / max(milp_p, 1e-9), 1),
+            })
+        st.dataframe(
+            pd.DataFrame(rows_b).style.highlight_max(
+                subset=["P(casse/an) évitée"], color="#abebc6"
+            ).highlight_min(
+                subset=["Coût / P évitée (M MAD)"], color="#abebc6"
+            ),
+            use_container_width=True, hide_index=True,
+        )
+
+        # ══════════════════════════════════════════════════════════════════
+        # B — KPIs ENRICHIS
+        # ══════════════════════════════════════════════════════════════════
+        st.divider()
+        st.subheader("B — KPIs enrichis du plan MILP")
+
+        if milp_ok6 and len(df_plan6) > 0:
+            # Merger plan avec données enrichies pour avoir les colonnes complètes
+            df_px = df_plan6.merge(
+                df_enr6[["GID", "P_casse_1an", "age_actuel", "urgence",
+                          "cout_renouvellement", "efficience", "age_ratio"]],
+                on="GID", how="left", suffixes=("", "_e"),
+            )
+            p_col = "P_casse_1an" if "P_casse_1an" in df_px.columns else "P_casse_1an_e"
+
+            tot_ftvi = int((df_all6["MAT_grp"] == "FTVI").sum())
+            tot_ac   = int((df_all6["MAT_grp"] == "AC").sum())
+            plan_ftvi = int((df_plan6["MAT_grp"] == "FTVI").sum()) if "MAT_grp" in df_plan6.columns else 0
+            plan_ac   = int((df_plan6["MAT_grp"] == "AC").sum())  if "MAT_grp" in df_plan6.columns else 0
+
+            p_plan_moy    = df_px[p_col].mean() if p_col in df_px else 0.0
+            p_reseau_moy  = df_enr6["P_casse_1an"].mean()
+            age_plan_moy  = df_px["age_actuel"].mean() if "age_actuel" in df_px.columns else 0.0
+            age_reseau_moy = df_enr6["age_actuel"].mean()
+            casses_evitees = float(df_px[p_col].sum()) if p_col in df_px.columns else milp_p
+            cout_casse     = milp_budget / max(casses_evitees, 1e-9) / 1e6
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Casses/an évitées",       f"{casses_evitees:.2f}",
+                      help="Σ P_casse_1an des tronçons planifiés = espérance annuelle de ruptures évitées")
+            k2.metric("Coût par casse évitée",   f"{cout_casse:.1f} M MAD")
+            k3.metric("% FTVI planifiés",         f"{plan_ftvi/max(tot_ftvi,1)*100:.0f}%",
+                      delta=f"{plan_ftvi}/{tot_ftvi}")
+            k4.metric("% AC planifiés",           f"{plan_ac/max(tot_ac,1)*100:.0f}%",
+                      delta=f"{plan_ac}/{tot_ac}")
+
+            k5, k6, k7, k8 = st.columns(4)
+            k5.metric("P_casse/an moyen — PLAN",   f"{p_plan_moy:.4%}",
+                      delta=f"{p_plan_moy - p_reseau_moy:+.4%} vs réseau", delta_color="off")
+            k6.metric("P_casse/an moyen — RÉSEAU", f"{p_reseau_moy:.4%}")
+            k7.metric("Âge moyen planifié",        f"{age_plan_moy:.0f} ans",
+                      delta=f"{age_plan_moy - age_reseau_moy:+.0f} vs réseau", delta_color="off")
+            k8.metric("Âge moyen réseau",          f"{age_reseau_moy:.0f} ans")
+
+            # Comparaison répartition matériaux plan vs réseau
+            st.subheader("Répartition matériaux : Plan MILP vs Réseau total")
+            mat_plan6   = df_plan6["MAT_grp"].value_counts(normalize=True) * 100
+            mat_reseau6 = df_all6["MAT_grp"].value_counts(normalize=True)  * 100
+            mats6 = sorted(set(mat_plan6.index) | set(mat_reseau6.index))
+            fig_mat = go.Figure()
+            fig_mat.add_bar(x=mats6, y=[mat_reseau6.get(m, 0) for m in mats6],
+                            name="Réseau total", marker_color="#3498db", opacity=0.6)
+            fig_mat.add_bar(x=mats6, y=[mat_plan6.get(m, 0) for m in mats6],
+                            name="Plan MILP",    marker_color="#e74c3c", opacity=0.85)
+            fig_mat.update_layout(
+                barmode="group", height=300, plot_bgcolor="white",
+                yaxis_title="% des tronçons",
+                title="Sur/sous-représentation par matériau dans le plan vs le réseau",
+            )
+            st.plotly_chart(fig_mat, use_container_width=True)
+
+            # Histogramme P_casse_1an : plan vs réseau
+            st.subheader("Distribution P_casse_1an : Plan vs Réseau")
+            fig_hist = go.Figure()
+            fig_hist.add_trace(go.Histogram(
+                x=df_enr6["P_casse_1an"], nbinsx=60, name="Réseau total",
+                marker_color="#3498db", opacity=0.5, histnorm="probability",
+            ))
+            if p_col in df_px.columns:
+                fig_hist.add_trace(go.Histogram(
+                    x=df_px[p_col], nbinsx=40, name="Plan MILP",
+                    marker_color="#e74c3c", opacity=0.75, histnorm="probability",
+                ))
+            fig_hist.update_layout(
+                barmode="overlay", height=300, plot_bgcolor="white",
+                xaxis_title="P_casse_1an", yaxis_title="Fréquence relative",
+                xaxis_tickformat=".2%",
+                title="Le plan doit surreprésenter les tronçons à haute P_casse_1an",
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+        else:
+            st.info("KPIs enrichis disponibles une fois l'API connectée et l'optimisation lancée.")
+
+        # ══════════════════════════════════════════════════════════════════
+        # C — COURBE PARETO
+        # ══════════════════════════════════════════════════════════════════
+        st.divider()
+        st.subheader("C — Frontière Pareto : efficience marginal du renouvellement")
+        st.caption(
+            "Tronçons triés par **P_casse_1an / coût** (plus efficient en premier). "
+            "La courbure montre le rendement décroissant — l'étoile rouge = position du plan MILP, "
+            "le losange orange = glouton."
+        )
+
+        df_par = df_top6.sort_values("efficience", ascending=False).reset_index(drop=True)
+        df_par["km_cumul"]      = df_par["LNG"].cumsum() / 1000
+        df_par["p_cumul"]       = df_par["P_casse_1an"].cumsum()
+        df_par["budget_cumul"]  = df_par["cout_renouvellement"].cumsum() / 1e6
+        df_par["idx"]           = range(1, len(df_par) + 1)
+
+        # Sous-échantillonnage pour fluidité
+        step6 = max(1, len(df_par) // 800)
+        df_par_s = df_par.iloc[::step6].copy()
+
+        fig_par = go.Figure()
+        fig_par.add_trace(go.Scatter(
+            x=df_par_s["km_cumul"], y=df_par_s["p_cumul"],
+            mode="lines", line=dict(color="#2980b9", width=2),
+            fill="tozeroy", fillcolor="rgba(41,128,185,0.08)",
+            name="Frontière Pareto",
+            hovertemplate="km cumulés: %{x:.1f}<br>P évitée: %{y:.3f}<extra></extra>",
+        ))
+        if milp_ok6:
+            fig_par.add_trace(go.Scatter(
+                x=[milp_km], y=[milp_p],
+                mode="markers+text",
+                marker=dict(color="#e74c3c", size=16, symbol="star"),
+                text=["MILP"], textposition="top right",
+                name="Plan MILP",
+                textfont=dict(color="#e74c3c", size=13),
+            ))
+        fig_par.add_trace(go.Scatter(
+            x=[glou_km], y=[glou_p],
+            mode="markers+text",
+            marker=dict(color="#f39c12", size=14, symbol="diamond"),
+            text=["Glouton"], textposition="top right",
+            name="Glouton",
+            textfont=dict(color="#f39c12", size=13),
+        ))
+        fig_par.add_trace(go.Scatter(
+            x=[rnd["km"]], y=[rnd["p_casse"]],
+            mode="markers+text",
+            marker=dict(color="#7f8c8d", size=12, symbol="circle"),
+            text=["Aléatoire"], textposition="bottom right",
+            name="Aléatoire",
+            textfont=dict(color="#7f8c8d", size=12),
+        ))
+        fig_par.update_layout(
+            xaxis_title="Km cumulés renouvelés",
+            yaxis_title="Σ P_casse_1an évitée (casses/an)",
+            height=420, plot_bgcolor="white",
+            title="Frontière Pareto : efficience du renouvellement",
+        )
+        st.plotly_chart(fig_par, use_container_width=True)
+
+        # ══════════════════════════════════════════════════════════════════
+        # D — EXPLICABILITÉ PAR TRONÇON
+        # ══════════════════════════════════════════════════════════════════
+        st.divider()
+        st.subheader("D — Explicabilité : pourquoi ce tronçon est-il dans le plan ?")
+        st.caption(
+            "Chaque barre = un tronçon planifié. Les segments colorés montrent la contribution "
+            "de chaque facteur à la décision (scores normalisés entre 0 et 1 sur le top-N analysé)."
+        )
+
+        if milp_ok6 and len(df_plan6) > 0:
+            df_exp = df_plan6.merge(
+                df_enr6[["GID", "P_casse_1an", "age_actuel", "urgence",
+                          "cout_renouvellement", "efficience", "age_ratio"]],
+                on="GID", how="left", suffixes=("", "_e"),
+            )
+            p_col_e = "P_casse_1an" if "P_casse_1an" in df_exp.columns else "P_casse_1an_e"
+
+            def _norm(s):
+                lo, hi = s.min(), s.max()
+                return (s - lo) / (hi - lo + 1e-12)
+
+            df_exp["f_p_casse"]    = _norm(df_exp[p_col_e].fillna(0))
+            df_exp["f_age_ratio"]  = _norm(df_exp["age_ratio"].fillna(0))
+            df_exp["f_efficience"] = _norm(df_exp["efficience"].fillna(0))
+            df_exp["f_urgence"]    = df_exp["urgence"].fillna(0).astype(float)
+
+            nb_exp = st.slider("Tronçons à expliquer", 5, min(150, len(df_exp)), min(30, len(df_exp)))
+            df_exp_top = df_exp.head(nb_exp).copy()
+
+            mat_col = df_exp_top["MAT_grp"].astype(str) if "MAT_grp" in df_exp_top.columns else ""
+            labels_y = (df_exp_top["GID"].astype(str)
+                        + " · " + mat_col
+                        + " · " + df_exp_top.get("age_actuel", pd.Series([0]*len(df_exp_top))).astype(int).astype(str) + " ans")
+
+            fig_exp = go.Figure()
+            for fname, fcol, fcolor in [
+                ("P(casse/an) — urgence actuelle",   "f_p_casse",    "#e74c3c"),
+                ("Âge / durée médiane",               "f_age_ratio",  "#e67e22"),
+                ("Efficience (P_casse/M MAD)",        "f_efficience", "#2980b9"),
+                ("Matériau urgence (FTVI/AC)",         "f_urgence",    "#8e44ad"),
+            ]:
+                fig_exp.add_trace(go.Bar(
+                    y=labels_y,
+                    x=df_exp_top[fcol],
+                    name=fname,
+                    orientation="h",
+                    marker_color=fcolor,
+                    opacity=0.85,
+                ))
+            fig_exp.update_layout(
+                barmode="stack",
+                height=max(420, nb_exp * 26),
+                xaxis_title="Score de contribution normalisé [0 → 1]",
+                plot_bgcolor="white",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                title="Décomposition des facteurs de décision — tronçons planifiés (triés par priorité)",
+                margin=dict(l=280),
+            )
+            st.plotly_chart(fig_exp, use_container_width=True)
+
+            # Tableau détaillé avec toutes les colonnes explicatives
+            st.subheader("Tableau détaillé des tronçons avec scores")
+            cols_exp = [c for c in [
+                "GID", "MAT_grp", "DIAMETRE_imp", "LNG_km", "annee_prevue",
+                "age_actuel", p_col_e, "age_ratio", "efficience", "urgence",
+                "cout_estime", "raison_priorite",
+            ] if c in df_exp_top.columns]
+            df_show = df_exp_top[cols_exp].copy()
+            rename_exp = {
+                "MAT_grp":        "Matériau",
+                "DIAMETRE_imp":   "Ø mm",
+                "LNG_km":         "Long. km",
+                "annee_prevue":   "Année",
+                "age_actuel":     "Âge (ans)",
+                p_col_e:          "P(casse/an)",
+                "age_ratio":      "Âge/Médiane",
+                "efficience":     "P/M MAD",
+                "urgence":        "Urgence",
+                "cout_estime":    "Coût (MAD)",
+                "raison_priorite": "Raison principale",
+            }
+            df_show = df_show.rename(columns={k: v for k, v in rename_exp.items() if k in df_show.columns})
+
+            fmt_exp = {}
+            if "P(casse/an)" in df_show.columns:   fmt_exp["P(casse/an)"]  = "{:.4%}"
+            if "Âge/Médiane" in df_show.columns:   fmt_exp["Âge/Médiane"]  = "{:.2f}"
+            if "P/M MAD"     in df_show.columns:   fmt_exp["P/M MAD"]      = "{:.4f}"
+            if "Coût (MAD)"  in df_show.columns:   fmt_exp["Coût (MAD)"]   = "{:,.0f}"
+
+            grad_s = [c for c in ["P(casse/an)", "Âge/Médiane"] if c in df_show.columns]
+            styled = df_show.style.format(fmt_exp)
+            if grad_s:
+                styled = styled.background_gradient(subset=grad_s[:1], cmap="RdYlGn_r")
+            st.dataframe(styled, use_container_width=True, height=420)
+
+            # Export
+            csv_exp = df_exp_top.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Exporter le plan annoté (CSV)",
+                csv_exp, "plan_annote_explicabilite.csv", "text/csv",
+            )
+
+        else:
+            st.info("L'explicabilité est disponible après lancement de l'optimisation MILP (API connectée).")
