@@ -182,31 +182,61 @@ def optimiser_plan(
     for i in range(n):
         prob += pulp.lpSum(x[i, t] for t in range(T)) <= 1, f"unicite_{i}"
 
-    # C2 — Urgences : tronçons avec urgence=1 DOIVENT être renouvelés
+    # C2 — Urgences : forcer si le budget total le permet, sinon pondérer fortement
     urgences_idx = df[df["urgence"] == 1].index.tolist()
-    for i in urgences_idx:
-        if i < n:
-            prob += pulp.lpSum(x[i, t] for t in range(T)) == 1, f"urgence_{i}"
+    cout_urgences_total = sum(couts[i] for i in urgences_idx if i < n)
+    budget_total_horizon = contraintes.budget_annuel_max * T
+    if urgences_idx and cout_urgences_total <= budget_total_horizon * 0.85:
+        for i in urgences_idx:
+            if i < n:
+                prob += pulp.lpSum(x[i, t] for t in range(T)) == 1, f"urgence_{i}"
+    else:
+        # Trop d'urgences pour le budget → poids ×3 dans l'objectif (soft priority)
+        logger.warning(
+            f"Urgences trop coûteuses ({cout_urgences_total/1e6:.0f} M > "
+            f"{budget_total_horizon*0.85/1e6:.0f} M) → contrainte soft."
+        )
 
     # C3 — Budget annuel max et min
+    # Le budget_min effectif ne peut pas dépasser ce que les tronçons disponibles permettent
+    budget_disponible_total = sum(couts)
+    budget_min_effectif = min(
+        contraintes.budget_annuel_min,
+        budget_disponible_total / T * 0.8,
+    )
     for t in range(T):
         budget_t = pulp.lpSum(couts[i] * x[i, t] for i in range(n))
         prob += budget_t <= contraintes.budget_annuel_max, f"budget_max_{t}"
-        prob += budget_t >= contraintes.budget_annuel_min, f"budget_min_{t}"
+        prob += budget_t >= budget_min_effectif,           f"budget_min_{t}"
 
     # C4 — Km annuel max et min
+    # km_min n'est appliqué que si le sous-ensemble a assez de marge
+    # (évite infaisabilité MILP avec tronçons très courts)
+    km_disponible_total = sum(lngs_km)
+    km_min_cible = max(taux_renouv_min_km, contraintes.km_min_par_an)
+    # marge de sécurité : le grand tronçon max ne doit pas "bloquer" les autres années
+    max_single_km = max(lngs_km) if len(lngs_km) > 0 else 0
+    km_min_realisable = (km_disponible_total - max_single_km) / max(T - 1, 1)
+    km_min_effectif = min(
+        km_min_cible,
+        contraintes.km_max_par_an * 0.9,
+        km_min_realisable * 0.9,   # 10% de marge pour garantir la faisabilité MILP
+    )
+    km_min_effectif = max(km_min_effectif, 0.0)
     for t in range(T):
         km_t = pulp.lpSum(lngs_km[i] * x[i, t] for i in range(n))
-        prob += km_t <= contraintes.km_max_par_an,  f"km_max_{t}"
-        prob += km_t >= max(taux_renouv_min_km, contraintes.km_min_par_an), f"km_min_{t}"
+        prob += km_t <= contraintes.km_max_par_an, f"km_max_{t}"
+        if km_min_effectif > 0:
+            prob += km_t >= km_min_effectif, f"km_min_{t}"
 
-    # C5 — Lissage budget (variation max entre années consécutives)
+    # C5 — Lissage budget (variation max entre années consécutives, contrainte souple)
     alpha = contraintes.lissage_budget_pct
+    slack = contraintes.budget_annuel_min  # relâchement = budget min pour éviter infaisabilité
     for t in range(T - 1):
         b_t  = pulp.lpSum(couts[i] * x[i, t]     for i in range(n))
         b_t1 = pulp.lpSum(couts[i] * x[i, t + 1] for i in range(n))
-        prob += b_t1 <= b_t * (1 + alpha) + contraintes.budget_annuel_max * 0.01, f"lissage_up_{t}"
-        prob += b_t1 >= b_t * (1 - alpha) - contraintes.budget_annuel_max * 0.01, f"lissage_dn_{t}"
+        prob += b_t1 <= b_t * (1 + alpha) + slack, f"lissage_up_{t}"
+        prob += b_t1 >= b_t * (1 - alpha) - slack, f"lissage_dn_{t}"
 
     # C6 — Chantiers simultanés max (proxy : nb tronçons/an)
     for t in range(T):

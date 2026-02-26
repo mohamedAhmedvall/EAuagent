@@ -16,8 +16,6 @@ Lancement :
   uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 """
 
-from __future__ import annotations
-
 import logging
 import math
 import os
@@ -28,6 +26,13 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+from api.models import (
+    ScoreRequest, ScoreResponse,
+    OptimisationRequest, ResultatOptimisation,
+    WhatIfRequest, WhatIfResponse,
+    ContraintesOptimisation,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -198,13 +203,11 @@ def detail_troncon(gid: int):
 
 
 @app.post("/score", tags=["Scoring"])
-def scorer_troncon(req: "ScoreRequest"):
+def scorer_troncon(req: ScoreRequest):
     """
     Score un tronçon avec les caractéristiques fournies via le modèle Weibull AFT.
     Utile pour simuler un nouveau tronçon ou tester un changement de matériau.
     """
-    from api.models import ScoreRequest, ScoreResponse
-
     waft, mat_cols = _get_weibull_model()
     import numpy as np
 
@@ -271,7 +274,7 @@ def scorer_troncon(req: "ScoreRequest"):
 
 
 @app.post("/optimiser", tags=["Optimisation"])
-def optimiser_plan(req: "OptimisationRequest"):
+def optimiser_plan(req: OptimisationRequest):
     """
     Génère un plan pluriannuel de renouvellement optimisé sous contraintes.
 
@@ -279,7 +282,6 @@ def optimiser_plan(req: "OptimisationRequest"):
     - Contraintes : budget, km/an, urgences, réglementaire, lissage
     - Retourne un plan détaillé par tronçon et un résumé par année
     """
-    from api.models import OptimisationRequest
     from api.optimizer import optimiser_plan as _opt
 
     df = _load_scoring()
@@ -294,7 +296,7 @@ def optimiser_plan(req: "OptimisationRequest"):
 
 
 @app.post("/whatif", tags=["What-If"])
-def whatif(req: "WhatIfRequest"):
+def whatif(req: WhatIfRequest):
     """
     Analyse what-if paramétrique : varie une ou plusieurs contraintes
     et compare les résultats de chaque scénario.
@@ -311,7 +313,6 @@ def whatif(req: "WhatIfRequest"):
     }
     ```
     """
-    from api.models import WhatIfRequest
     from api.optimizer import whatif_analyse
 
     df = _load_scoring()
@@ -321,12 +322,8 @@ def whatif(req: "WhatIfRequest"):
 @app.get("/contraintes/defaut", tags=["Contraintes"])
 def contraintes_defaut():
     """Retourne les valeurs par défaut de toutes les contraintes."""
-    from api.models import ContraintesOptimisation
     return ContraintesOptimisation().model_dump()
 
-
-# ─── Import des modèles pour les annotations ──────────────────────────────
-from api.models import ScoreRequest, OptimisationRequest, WhatIfRequest  # noqa
 
 
 if __name__ == "__main__":
