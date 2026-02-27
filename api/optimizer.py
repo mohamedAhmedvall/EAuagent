@@ -76,7 +76,7 @@ def ajouter_p_casse_1an(df: pd.DataFrame) -> pd.DataFrame:
 # ─── Utilitaires ──────────────────────────────────────────────────────────
 
 def _cout_km(materiau: str, cout_config: CoutParMateriau) -> float:
-    """Retourne le coût MAD/km pour un matériau donné."""
+    """Retourne le coût EUR/km pour un matériau donné."""
     mapping = {
         "FT":    cout_config.FT,
         "FTG":   cout_config.FTG,
@@ -559,7 +559,7 @@ def whatif_analyse(
             f"Le scénario optimal ({best_params}) réduit le risque résiduel à "
             f"{meilleur.risque_residuel_pct:.1f}% en renouvelant "
             f"{meilleur.km_renouveles_total:.1f} km pour "
-            f"{meilleur.budget_total/1e6:.1f} M MAD."
+            f"{meilleur.budget_total/1e6:.1f} M EUR."
         )
     else:
         recommandation = "Aucun scénario valide — assouplir les contraintes budget/km."

@@ -50,7 +50,7 @@ class TronconScored(TronconBase):
     top10_pourcent: int
     age_actuel: Optional[float] = None
     P_casse_1an: Optional[float] = None      # P(casse prochaine année | survie jusqu'à aujourd'hui)
-    cout_renouvellement_estime: Optional[float] = None  # MAD
+    cout_renouvellement_estime: Optional[float] = None  # EUR
 
 class TronconDetail(TronconScored):
     STATUT_OBJET: str = "EN SERVICE"
@@ -102,9 +102,9 @@ class CoutParMateriau(BaseModel):
 
 class ContraintesOptimisation(BaseModel):
     # Financier
-    budget_annuel_max: float = Field(500_000_000, description="Budget max annuel (MAD)")
-    budget_annuel_min: float = Field(50_000_000,  description="Budget min annuel (MAD)")
-    cout_km: CoutParMateriau = Field(default_factory=CoutParMateriau, description="Coût MAD/km par matériau")
+    budget_annuel_max: float = Field(500_000_000, description="Budget max annuel (EUR)")
+    budget_annuel_min: float = Field(50_000_000,  description="Budget min annuel (EUR)")
+    cout_km: CoutParMateriau = Field(default_factory=CoutParMateriau, description="Coût EUR/km par matériau")
 
     # Capacité
     km_max_par_an: float = Field(80.0,  description="Max km renouvelables/an")
