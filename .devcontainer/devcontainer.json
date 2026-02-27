@@ -44,7 +44,7 @@
   },
 
   // apt-get fonctionne ici car containerEnv (proxy) est déjà injecté
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y coinor-cbc && pip install --no-cache-dir -r requirements.txt",
+  "postCreateCommand": "pip install --no-cache-dir -r requirements.txt",
 
   // Démarre automatiquement l'API et l'IHM
   "postStartCommand": "bash .devcontainer/start_services.sh",
