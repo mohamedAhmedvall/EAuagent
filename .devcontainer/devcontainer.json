@@ -1,0 +1,52 @@
+{
+  "name": "SOMEI — Plan de Renouvellement Réseau Eau",
+
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  "workspaceFolder": "/workspace",
+
+  "mounts": [
+    "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
+  ],
+
+  // Ports: FastAPI (8000) + Streamlit (8501)
+  "forwardPorts": [8000, 8501],
+  "portsAttributes": {
+    "8000": {
+      "label": "API FastAPI",
+      "onAutoForward": "notify"
+    },
+    "8501": {
+      "label": "IHM Streamlit",
+      "onAutoForward": "openBrowser"
+    }
+  },
+
+  // Réinstalle les dépendances si requirements.txt a changé
+  "postCreateCommand": "pip install --no-cache-dir -r requirements.txt",
+
+  // Démarre automatiquement les deux services au lancement du conteneur
+  "postStartCommand": "bash .devcontainer/start_services.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.pylance",
+        "ms-toolsai.jupyter",
+        "ms-python.black-formatter"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.terminal.activateEnvironment": false,
+        "editor.formatOnSave": true,
+        "[python]": {
+          "editor.defaultFormatter": "ms-python.black-formatter"
+        }
+      }
+    }
+  }
+}
