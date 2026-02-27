@@ -1,0 +1,5 @@
+Modèle,AIC,BIC,C-index
+Cox PH,-,-,0.5862
+Weibull AFT,370973.5,370959.8,0.7503
+Log-Normal AFT,379978.6,379964.9,0.7481
+Log-Logistique AFT,373045.9,373032.3,0.7525
