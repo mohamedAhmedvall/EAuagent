@@ -73,10 +73,12 @@ def _get_weibull_model():
         mat_dummies = pd.get_dummies(df["MAT_grp"], prefix="mat", drop_first=False)
         mat_cols = [f"mat_{m}" for m in mats_keep]
 
+        # NOTE : DDP_year et taux_anomalie_par_an exclus (biais de collinéarité /
+        # data leakage — voir etape6_weibull.py pour la justification détaillée).
         covariates_num = [
-            "DIAMETRE_imp", "LNG_log", "DDP_year",
+            "DIAMETRE_imp", "LNG_log",
             "nb_anomalies", "nb_fuites_signalees", "nb_fuites_detectees",
-            "taux_anomalie_par_an", "DT_NB_LOGEMENT_imp", "DT_FLUX_CIRCULATION_imp",
+            "DT_NB_LOGEMENT_imp", "DT_FLUX_CIRCULATION_imp",
         ]
         model_df = df[[duration_col, event_col]].copy()
         for col in covariates_num:
@@ -222,14 +224,14 @@ def scorer_troncon(req: ScoreRequest):
     import numpy as np
 
     lng_log = float(np.log1p(req.LNG))
+    # NOTE : DDP_year et taux_anomalie_par_an exclus du modèle (biais collinéarité /
+    # data leakage — voir etape6_weibull.py).
     profile = {
         "DIAMETRE_imp": req.DIAMETRE_imp,
         "LNG_log": lng_log,
-        "DDP_year": req.DDP_year,
         "nb_anomalies": req.nb_anomalies,
         "nb_fuites_signalees": req.nb_fuites_signalees,
         "nb_fuites_detectees": req.nb_fuites_detectees,
-        "taux_anomalie_par_an": req.taux_anomalie_par_an,
         "DT_NB_LOGEMENT_imp": req.DT_NB_LOGEMENT_imp,
         "DT_FLUX_CIRCULATION_imp": req.DT_FLUX_CIRCULATION_imp,
     }

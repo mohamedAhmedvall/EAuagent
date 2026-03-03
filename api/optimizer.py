@@ -26,7 +26,20 @@ from api.models import (
 logger = logging.getLogger(__name__)
 
 ANNEE_REF = 2026  # année courante de référence
-RHO_WEIBULL = 2.78  # paramètre de forme Weibull AFT (estimé étape 6)
+
+# Lire rho depuis le fichier généré par etape6/8 (évite la valeur hardcodée périmée)
+def _load_rho() -> float:
+    """Charge le paramètre de forme Weibull depuis models/weibull_rho.csv."""
+    import os
+    rho_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "models", "weibull_rho.csv")
+    try:
+        s = pd.read_csv(rho_path, index_col=0).squeeze()
+        return float(s["rho_weibull"])
+    except Exception:
+        return 2.2101   # valeur de repli issue de l'ajustement corrigé (sans DDP_year)
+
+RHO_WEIBULL = _load_rho()
 
 
 # ─── Probabilité de casse annuelle ────────────────────────────────────────

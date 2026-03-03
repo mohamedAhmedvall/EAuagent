@@ -537,7 +537,6 @@ elif page == "🎯 Scorer un tronçon":
             nb_anomalies = st.number_input("Nb anomalies", 0, 100, 0)
             nb_fuites_sig = st.number_input("Fuites signalées", 0, 50, 0)
             nb_fuites_det = st.number_input("Fuites détectées", 0, 50, 0)
-            taux_anomalie = st.number_input("Taux anomalie/an", 0.0, 1.0, 0.0, step=0.01)
         submitted = st.form_submit_button("🔬 Calculer le score", use_container_width=True)
 
     if submitted:
@@ -545,11 +544,10 @@ elif page == "🎯 Scorer un tronçon":
             "MAT_grp": mat,
             "DIAMETRE_imp": diametre,
             "LNG": lng,
-            "DDP_year": annee_pose,
+            "DDP_year": annee_pose,       # utilisé pour l'âge actuel uniquement
             "nb_anomalies": nb_anomalies,
             "nb_fuites_signalees": nb_fuites_sig,
             "nb_fuites_detectees": nb_fuites_det,
-            "taux_anomalie_par_an": taux_anomalie,
         }
         with st.spinner("Calcul en cours …"):
             result, err = api_post("/score", payload)

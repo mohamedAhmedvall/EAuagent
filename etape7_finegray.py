@@ -41,10 +41,11 @@ if 'FT' in mats_keep:
 mat_dummies = pd.get_dummies(df['MAT_grp'], prefix='mat', drop_first=False)
 mat_cols = [f'mat_{m}' for m in mats_keep]
 
+# NOTE : DDP_year et taux_anomalie_par_an exclus (biais collinéarité / data leakage)
+# — voir etape6_weibull.py pour la justification détaillée.
 covariates_num = [
-    'DIAMETRE_imp', 'LNG_log', 'DDP_year',
+    'DIAMETRE_imp', 'LNG_log',
     'nb_anomalies', 'nb_fuites_signalees', 'nb_fuites_detectees',
-    'taux_anomalie_par_an',
     'DT_NB_LOGEMENT_imp', 'DT_FLUX_CIRCULATION_imp',
 ]
 

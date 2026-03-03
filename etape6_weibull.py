@@ -2,9 +2,24 @@
 ÉTAPE 6 — Modélisation Weibull AFT sur Dataset B (tous abandons)
 ================================================================
 - Ajustement Weibull AFT multivarié
-- Comparaison AIC/BIC avec Cox
+- Comparaison AIC/BIC avec Log-Normal et Log-Logistique
 - Paramètres de forme (rho) et d'échelle (lambda) par matériau
 - Courbes de survie paramétriques
+- Évaluation honnête sur train/test split
+
+Covariables retenues (sans fuite de données) :
+  - MAT_grp (dummies, ref=FT)
+  - DIAMETRE_imp, LNG_log
+  - nb_anomalies, nb_fuites_signalees, nb_fuites_detectees
+  - DT_NB_LOGEMENT_imp, DT_FLUX_CIRCULATION_imp
+
+Exclusions justifiées :
+  - DDP_year : corrélation = -1.0 avec duration_years pour les 84% de tronçons
+    censurés (tronçons encore en service : DDP_year = 2024 - duration_years).
+    Inclure DDP_year revient à mettre la variable cible dans les covariables pour
+    84% des observations → biais majeur, médiane prédite ∝ ancienneté de pose.
+  - taux_anomalie_par_an : = nb_anomalies / duration_years → data leakage direct
+    (duration_years est la variable de durée du modèle de survie).
 """
 
 import pandas as pd
@@ -16,6 +31,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from lifelines import WeibullAFTFitter, LogNormalAFTFitter, LogLogisticAFTFitter
+from lifelines.utils import concordance_index
+from sklearn.model_selection import train_test_split
 
 # ── 1. Chargement ──────────────────────────────────────────────
 print("=" * 60)
@@ -35,10 +52,10 @@ if 'FT' in mats_keep:
 mat_dummies = pd.get_dummies(df['MAT_grp'], prefix='mat', drop_first=False)
 mat_cols = [f'mat_{m}' for m in mats_keep]
 
+# NOTE : DDP_year et taux_anomalie_par_an retirés (voir docstring)
 covariates_num = [
-    'DIAMETRE_imp', 'LNG_log', 'DDP_year',
+    'DIAMETRE_imp', 'LNG_log',
     'nb_anomalies', 'nb_fuites_signalees', 'nb_fuites_detectees',
-    'taux_anomalie_par_an',
     'DT_NB_LOGEMENT_imp', 'DT_FLUX_CIRCULATION_imp',
 ]
 
@@ -55,51 +72,70 @@ model_df = model_df.dropna()
 model_df = model_df[model_df[duration_col] > 0]
 print(f"Observations : {len(model_df)}, Événements : {model_df[event_col].sum()}")
 
-# ── 3. Ajustement Weibull AFT ─────────────────────────────────
+# ── 3. Split train/test (80/20) ────────────────────────────────
+train_df, test_df = train_test_split(model_df, test_size=0.20, random_state=42)
+print(f"Train : {len(train_df)} | Test : {len(test_df)}")
+
+# ── 4. Ajustement Weibull AFT ─────────────────────────────────
 print("\n── Ajustement Weibull AFT ──")
 waft = WeibullAFTFitter(penalizer=0.01)
-waft.fit(model_df, duration_col=duration_col, event_col=event_col)
+waft.fit(train_df, duration_col=duration_col, event_col=event_col)
+
+c_train = waft.concordance_index_
+c_test = concordance_index(
+    test_df[duration_col],
+    waft.predict_median(test_df),   # predict_median = durée → plus haute = meilleure
+    test_df[event_col],
+)
+
+print(f"\nC-index (train) : {c_train:.4f}")
+print(f"C-index (test)  : {c_test:.4f}  ← valeur honnête hors-échantillon")
+print(f"AIC Weibull : {waft.AIC_:.1f}")
+print(f"BIC Weibull : {waft.BIC_:.1f}")
 
 print("\n── RÉSULTATS WEIBULL AFT ──")
 summary_w = waft.summary
 print(summary_w.to_string())
-print(f"\nAIC Weibull : {waft.AIC_:.1f}")
-print(f"BIC Weibull : {waft.BIC_:.1f}")
-print(f"C-index Weibull : {waft.concordance_index_:.4f}")
 
-# ── 4. Log-Normal AFT pour comparaison ────────────────────────
+# ── 5. Log-Normal AFT pour comparaison ────────────────────────
 print("\n── Ajustement Log-Normal AFT ──")
 lnaft = LogNormalAFTFitter(penalizer=0.01)
-lnaft.fit(model_df, duration_col=duration_col, event_col=event_col)
-print(f"AIC Log-Normal : {lnaft.AIC_:.1f}")
-print(f"BIC Log-Normal : {lnaft.BIC_:.1f}")
-print(f"C-index Log-Normal : {lnaft.concordance_index_:.4f}")
+lnaft.fit(train_df, duration_col=duration_col, event_col=event_col)
+c_test_ln = concordance_index(
+    test_df[duration_col],
+    lnaft.predict_median(test_df),
+    test_df[event_col],
+)
+print(f"AIC Log-Normal : {lnaft.AIC_:.1f} | C-index test : {c_test_ln:.4f}")
 
-# ── 5. Log-Logistic AFT pour comparaison ──────────────────────
+# ── 6. Log-Logistic AFT pour comparaison ──────────────────────
 print("\n── Ajustement Log-Logistique AFT ──")
 llaft = LogLogisticAFTFitter(penalizer=0.01)
-llaft.fit(model_df, duration_col=duration_col, event_col=event_col)
-print(f"AIC Log-Logistique : {llaft.AIC_:.1f}")
-print(f"BIC Log-Logistique : {llaft.BIC_:.1f}")
-print(f"C-index Log-Logistique : {llaft.concordance_index_:.4f}")
+llaft.fit(train_df, duration_col=duration_col, event_col=event_col)
+c_test_ll = concordance_index(
+    test_df[duration_col],
+    llaft.predict_median(test_df),
+    test_df[event_col],
+)
+print(f"AIC Log-Logistique : {llaft.AIC_:.1f} | C-index test : {c_test_ll:.4f}")
 
-# ── 6. Tableau comparatif ─────────────────────────────────────
-print("\n" + "=" * 55)
-print("COMPARAISON DES MODÈLES")
-print("=" * 55)
+# ── 7. Tableau comparatif ─────────────────────────────────────
+print("\n" + "=" * 65)
+print("COMPARAISON DES MODÈLES (C-index sur test set — hors-échantillon)")
+print("=" * 65)
 comparison = pd.DataFrame({
-    'Modèle': ['Cox PH', 'Weibull AFT', 'Log-Normal AFT', 'Log-Logistique AFT'],
-    'AIC': ['-', f'{waft.AIC_:.1f}', f'{lnaft.AIC_:.1f}', f'{llaft.AIC_:.1f}'],
-    'BIC': ['-', f'{waft.BIC_:.1f}', f'{lnaft.BIC_:.1f}', f'{llaft.BIC_:.1f}'],
-    'C-index': ['0.5862', f'{waft.concordance_index_:.4f}', f'{lnaft.concordance_index_:.4f}', f'{llaft.concordance_index_:.4f}'],
+    'Modèle': ['Weibull AFT', 'Log-Normal AFT', 'Log-Logistique AFT'],
+    'AIC': [f'{waft.AIC_:.1f}', f'{lnaft.AIC_:.1f}', f'{llaft.AIC_:.1f}'],
+    'BIC': [f'{waft.BIC_:.1f}', f'{lnaft.BIC_:.1f}', f'{llaft.BIC_:.1f}'],
+    'C-index (test)': [f'{c_test:.4f}', f'{c_test_ln:.4f}', f'{c_test_ll:.4f}'],
 })
 print(comparison.to_string(index=False))
 comparison.to_csv('/home/user/EAuagent/models/comparaison_modeles.csv', index=False)
 
-# ── 7. Sauvegarde résumé Weibull ──────────────────────────────
+# ── 8. Sauvegarde résumé Weibull ──────────────────────────────
 summary_w.to_csv('/home/user/EAuagent/models/weibull_aft_summary_B.csv')
 
-# ── 8. Paramètre de forme Weibull ─────────────────────────────
+# ── 9. Paramètre de forme Weibull ─────────────────────────────
 rho = np.exp(waft.summary.loc[('rho_', 'Intercept'), 'coef'])
 print(f"\nParamètre de forme Weibull (rho) : {rho:.4f}")
 if rho > 1:
@@ -109,9 +145,15 @@ elif rho < 1:
 else:
     print("  → rho ≈ 1 : risque constant (exponentiel)")
 
-# ── 9. FIGURES ────────────────────────────────────────────────
+# Sauvegarder rho pour l'optimizer
+pd.Series({'rho_weibull': rho}).to_csv(
+    '/home/user/EAuagent/models/weibull_rho.csv', header=True
+)
+print(f"Paramètre rho sauvegardé : models/weibull_rho.csv")
 
-# 9a. Comparaison AIC des modèles paramétriques
+# ── 10. FIGURES ───────────────────────────────────────────────
+
+# 10a. Comparaison AIC
 fig, ax = plt.subplots(figsize=(8, 5))
 models_aic = {
     'Weibull AFT': waft.AIC_,
@@ -132,15 +174,13 @@ plt.savefig('/home/user/EAuagent/figures/etape6_comparaison_aic.png', dpi=150)
 plt.close()
 print("Figure sauvegardée : figures/etape6_comparaison_aic.png")
 
-# 9b. Courbes de survie Weibull par matériau
+# 10b. Courbes de survie Weibull par matériau
 fig, ax = plt.subplots(figsize=(10, 6))
 
 materials_plot = ['FT'] + mats_keep[:6]
 colors_mat = plt.cm.Set1(np.linspace(0, 1, len(materials_plot)))
-median_vals = model_df[covariates_num].median()
 
 for i, mat in enumerate(materials_plot):
-    # Filtrer
     if mat == 'FT':
         mask = pd.Series(True, index=model_df.index)
         for mc in mat_cols:
@@ -163,8 +203,11 @@ for i, mat in enumerate(materials_plot):
 
 ax.set_xlabel('Durée (années)', fontsize=11)
 ax.set_ylabel('S(t) — Probabilité de survie', fontsize=11)
-ax.set_title('Weibull AFT — Courbes de survie par matériau\n(Dataset B — tous abandons)',
-             fontsize=13, fontweight='bold')
+ax.set_title(
+    f'Weibull AFT — Courbes de survie par matériau\n'
+    f'C-index test = {c_test:.3f} (sans DDP_year, sans leakage)',
+    fontsize=13, fontweight='bold'
+)
 ax.legend(fontsize=9)
 ax.grid(alpha=0.3)
 ax.set_ylim(0, 1.05)
@@ -174,10 +217,8 @@ plt.savefig('/home/user/EAuagent/figures/etape6_weibull_survie_materiau.png', dp
 plt.close()
 print("Figure sauvegardée : figures/etape6_weibull_survie_materiau.png")
 
-# 9c. Coefficients Weibull (lambda_ = partie accélération)
+# 10c. Coefficients Weibull
 fig, ax = plt.subplots(figsize=(10, 7))
-
-# Extraire les coefficients lambda (accélération de vie)
 lambda_coefs = summary_w.loc['lambda_']
 lambda_coefs = lambda_coefs[lambda_coefs.index != 'Intercept']
 coefs = lambda_coefs['coef'].sort_values()
@@ -190,7 +231,7 @@ ax.set_yticks(range(len(coefs)))
 ax.set_yticklabels(coefs.index, fontsize=9)
 ax.axvline(x=0, color='black', linestyle='--', linewidth=1)
 ax.set_xlabel('Coefficient Weibull AFT (>0 = durée de vie plus longue)', fontsize=11)
-ax.set_title('Weibull AFT — Coefficients d\'accélération (λ)\n(Dataset B, réf. = FT)',
+ax.set_title("Weibull AFT — Coefficients d'accélération (λ)\n(Dataset B, réf. = FT)",
              fontsize=13, fontweight='bold')
 
 import matplotlib.patches as mpatches
@@ -206,7 +247,7 @@ plt.savefig('/home/user/EAuagent/figures/etape6_weibull_coefficients.png', dpi=1
 plt.close()
 print("Figure sauvegardée : figures/etape6_weibull_coefficients.png")
 
-# 9d. Durées médianes prédites par matériau
+# 10d. Durées médianes prédites par matériau
 fig, ax = plt.subplots(figsize=(9, 5))
 
 medians = {}
@@ -238,7 +279,7 @@ for j, (mat, val) in enumerate(zip(mats_sorted, vals)):
     ax.text(min(val, 120) + 1, j, label, va='center', fontsize=10)
 
 ax.set_xlabel('Durée médiane prédite (années)', fontsize=11)
-ax.set_title('Weibull AFT — Durée médiane de survie par matériau\n(Dataset B)',
+ax.set_title('Weibull AFT — Durée médiane de survie par matériau\n(Dataset B, sans DDP_year ni leakage)',
              fontsize=13, fontweight='bold')
 ax.set_xlim(0, 140)
 ax.grid(axis='x', alpha=0.3)

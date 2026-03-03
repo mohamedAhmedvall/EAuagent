@@ -5,6 +5,12 @@
 - Courbes de survie prédites pour différents profils
 - Identification des tronçons prioritaires (top 10%)
 - Export du scoring complet
+
+Covariables : identiques à etape6 (sans DDP_year, sans taux_anomalie_par_an)
+  → Voir etape6_weibull.py pour la justification des exclusions.
+
+Le modèle est entraîné sur 80% des données.
+Les scores sont calculés sur l'intégralité du dataset (train + test).
 """
 
 import pandas as pd
@@ -16,8 +22,10 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from lifelines import WeibullAFTFitter
+from lifelines.utils import concordance_index
+from sklearn.model_selection import train_test_split
 
-# ── 1. Chargement et réajustement Weibull ─────────────────────
+# ── 1. Chargement ─────────────────────────────────────────────
 print("=" * 60)
 print("ÉTAPE 8 — SCORING & PRÉDICTION PAR TRONÇON")
 print("=" * 60)
@@ -27,7 +35,7 @@ df = pd.read_csv('/home/user/EAuagent/data/dataset_B_simple.csv')
 duration_col = 'duration_years'
 event_col = 'event_bin'
 
-# Préparation identique à l'étape 6
+# ── 2. Préparation (identique à etape6) ───────────────────────
 mat_counts = df['MAT_grp'].value_counts()
 mats_keep = mat_counts[mat_counts > 500].index.tolist()
 if 'FT' in mats_keep:
@@ -35,10 +43,10 @@ if 'FT' in mats_keep:
 mat_dummies = pd.get_dummies(df['MAT_grp'], prefix='mat', drop_first=False)
 mat_cols = [f'mat_{m}' for m in mats_keep]
 
+# NOTE : DDP_year et taux_anomalie_par_an exclus (voir etape6_weibull.py)
 covariates_num = [
-    'DIAMETRE_imp', 'LNG_log', 'DDP_year',
+    'DIAMETRE_imp', 'LNG_log',
     'nb_anomalies', 'nb_fuites_signalees', 'nb_fuites_detectees',
-    'taux_anomalie_par_an',
     'DT_NB_LOGEMENT_imp', 'DT_FLUX_CIRCULATION_imp',
 ]
 
@@ -54,17 +62,34 @@ for col in mat_cols:
 model_df = model_df.dropna()
 model_df = model_df[model_df[duration_col] > 0]
 
-# Réajuster Weibull AFT
+# ── 3. Split train/test (80/20) ────────────────────────────────
+train_df, test_df = train_test_split(model_df, test_size=0.20, random_state=42)
+print(f"Train : {len(train_df)} | Test : {len(test_df)}")
+
+# ── 4. Ajustement Weibull AFT sur train ───────────────────────
 waft = WeibullAFTFitter(penalizer=0.01)
-waft.fit(model_df, duration_col=duration_col, event_col=event_col)
+waft.fit(train_df, duration_col=duration_col, event_col=event_col)
 
-# ── 2. Prédictions ────────────────────────────────────────────
-print("\n── Calcul des scores de risque ──")
+c_train = waft.concordance_index_
+c_test = concordance_index(
+    test_df[duration_col],
+    waft.predict_median(test_df),   # predict_median = durée → plus haute = meilleure
+    test_df[event_col],
+)
+print(f"C-index train : {c_train:.4f} | test : {c_test:.4f}")
 
-# Durée médiane prédite = indicateur principal
+# Sauvegarder rho pour optimizer.py
+rho = float(np.exp(waft.summary.loc[('rho_', 'Intercept'), 'coef']))
+print(f"Paramètre de forme Weibull rho = {rho:.4f}")
+pd.Series({'rho_weibull': rho}).to_csv(
+    '/home/user/EAuagent/models/weibull_rho.csv', header=True
+)
+
+# ── 5. Prédictions sur TOUT le dataset ────────────────────────
+print("\n── Calcul des scores de risque (tous tronçons) ──")
+
 median_pred = waft.predict_median(model_df)
 
-# Probabilité de survie à différents horizons
 horizons = [10, 20, 30, 50, 70]
 surv_probs = {}
 for h in horizons:
@@ -74,7 +99,7 @@ for h in horizons:
 # Score de risque = 1 - P(survie à 50 ans)
 risk_score = 1 - surv_probs['P_survie_50ans']
 
-# ── 3. Construire le tableau de scoring ───────────────────────
+# ── 6. Construire le tableau de scoring ───────────────────────
 scoring = df.loc[model_df.index].copy()
 scoring['duree_mediane_pred'] = median_pred.values
 scoring['risk_score_50ans'] = risk_score
@@ -82,26 +107,47 @@ for h in horizons:
     scoring[f'P_survie_{h}ans'] = surv_probs[f'P_survie_{h}ans']
 
 # Déciles de risque
-scoring['decile_risque'] = pd.qcut(scoring['risk_score_50ans'], 10, labels=False, duplicates='drop') + 1
+scoring['decile_risque'] = pd.qcut(
+    scoring['risk_score_50ans'], 10, labels=False, duplicates='drop'
+) + 1
 scoring['top10_pourcent'] = (scoring['decile_risque'] == 10).astype(int)
 
 print(f"\nTronçons scorés : {len(scoring)}")
 print(f"Top 10% à risque : {scoring['top10_pourcent'].sum()} tronçons")
 
-# ── 4. Statistiques par décile ────────────────────────────────
-print("\n── STATISTIQUES PAR DÉCILE DE RISQUE ──")
+# ── 7. Validation : taux d'abandon réel par décile ────────────
+print("\n── VALIDATION : Taux d'abandon réel par décile ──")
 decile_stats = scoring.groupby('decile_risque').agg(
     n_troncons=('GID', 'count'),
     taux_abandon_reel=(event_col, 'mean'),
     risk_score_moyen=('risk_score_50ans', 'mean'),
     duree_mediane_moy=('duree_mediane_pred', 'mean'),
-    pct_FTG=('MAT_grp', lambda x: (x == 'FTG').mean()),
-    pct_FT=('MAT_grp', lambda x: (x == 'FT').mean()),
-    diametre_moyen=('DIAMETRE_imp', 'mean'),
 ).round(3)
 print(decile_stats.to_string())
+print()
+print("NOTE INTERPRÉTATION : taux_abandon_reel n'est PAS une validation directe.")
+print("  Le modèle prédit le risque SOUS-JACENT (indépendant de l'âge observé).")
+print("  Un tronçon en décile 10 peut avoir un faible taux_abandon_reel simplement")
+print("  parce qu'il est jeune (peu de temps pour échouer pendant la période d'observation).")
+print("  Validation correcte = stratification par âge (ci-dessous) ou score de Brier.")
 
-# ── 5. Profil des top 10% ────────────────────────────────────
+# Validation age-stratifiée : à âge comparable, le score est-il bien corrélé avec l'abandon ?
+print()
+print("── VALIDATION STRATIFIÉE PAR ÂGE (taux_abandon_reel) ──")
+scoring['age_actuel'] = 2026 - scoring['DDP_year']
+scoring['tranche_age'] = pd.cut(scoring['age_actuel'], bins=[0, 20, 40, 60, 100], labels=['0-20', '20-40', '40-60', '60+'])
+for tranche, g in scoring.groupby('tranche_age', observed=True):
+    if len(g) < 500:
+        continue
+    # Corrélation rang entre risk_score et event_bin (Spearman)
+    from scipy.stats import spearmanr
+    r, pv = spearmanr(g['risk_score_50ans'], g[event_col])
+    d1 = g[g['decile_risque'] <= 3][event_col].mean()
+    d10 = g[g['decile_risque'] >= 8][event_col].mean()
+    print(f"  Âge {tranche}: n={len(g)}, SpearmanR={r:.3f} (p={pv:.3f}), "
+          f"abandon bas-décile={d1:.3f} vs haut-décile={d10:.3f}")
+
+# ── 8. Profil des top 10% ────────────────────────────────────
 top10 = scoring[scoring['top10_pourcent'] == 1]
 print(f"\n── PROFIL DES TOP 10% (n={len(top10)}) ──")
 print(f"Taux d'abandon réel : {top10[event_col].mean()*100:.1f}%")
@@ -109,10 +155,8 @@ print(f"Score de risque moyen : {top10['risk_score_50ans'].mean():.3f}")
 print(f"Durée médiane prédite moyenne : {top10['duree_mediane_pred'].mean():.1f} ans")
 print(f"\nDistribution matériau :")
 print(top10['MAT_grp'].value_counts(normalize=True).head(5).to_string())
-print(f"\nDécennie de pose :")
-print(top10['decade_pose'].value_counts(normalize=True).sort_index().to_string())
 
-# ── 6. Export du scoring ──────────────────────────────────────
+# ── 9. Export du scoring ──────────────────────────────────────
 export_cols = ['GID', 'MAT_grp', 'DIAMETRE_imp', 'LNG', 'DDP_year', 'decade_pose',
                'nb_anomalies', 'nb_fuites_signalees', 'nb_fuites_detectees',
                'STATUT_OBJET', 'abandon_type', event_col,
@@ -124,9 +168,9 @@ scoring_export = scoring[[c for c in export_cols if c in scoring.columns]]
 scoring_export.to_csv('/home/user/EAuagent/models/scoring_troncons.csv', index=False)
 print(f"\nScoring exporté : models/scoring_troncons.csv ({len(scoring_export)} lignes)")
 
-# ── 7. FIGURES ────────────────────────────────────────────────
+# ── 10. FIGURES ───────────────────────────────────────────────
 
-# 7a. Distribution du score de risque
+# 10a. Distribution du score de risque
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
 ax = axes[0]
@@ -145,17 +189,21 @@ ax.axvline(scoring['duree_mediane_pred'].median(), color='black', linestyle='--'
            linewidth=2, label=f'Médiane = {scoring["duree_mediane_pred"].median():.0f} ans')
 ax.set_xlabel('Durée médiane prédite (années)', fontsize=11)
 ax.set_ylabel('Nombre de tronçons', fontsize=11)
-ax.set_title('Distribution des durées médianes prédites', fontsize=12, fontweight='bold')
+ax.set_title('Distribution des durées médianes prédites\n(sans DDP_year, sans leakage)',
+             fontsize=12, fontweight='bold')
 ax.legend()
 ax.grid(alpha=0.3)
 
-plt.suptitle('Scoring Weibull AFT — Dataset B', fontsize=14, fontweight='bold')
+plt.suptitle(
+    f'Scoring Weibull AFT — Dataset B | C-index test = {c_test:.3f}',
+    fontsize=14, fontweight='bold'
+)
 plt.tight_layout()
 plt.savefig('/home/user/EAuagent/figures/etape8_distribution_scores.png', dpi=150)
 plt.close()
 print("Figure sauvegardée : figures/etape8_distribution_scores.png")
 
-# 7b. Taux d'abandon réel par décile (validation)
+# 10b. Taux d'abandon réel par décile (validation)
 fig, ax = plt.subplots(figsize=(9, 5))
 decile_abandon = scoring.groupby('decile_risque')[event_col].mean() * 100
 
@@ -166,9 +214,12 @@ for bar, val in zip(bars, decile_abandon.values):
             f'{val:.1f}%', ha='center', fontsize=9)
 
 ax.set_xlabel('Décile de risque (1=faible, 10=élevé)', fontsize=11)
-ax.set_ylabel('Taux d\'abandon réel (%)', fontsize=11)
-ax.set_title('Validation — Taux d\'abandon réel par décile de risque\n(Weibull AFT, Dataset B)',
-             fontsize=13, fontweight='bold')
+ax.set_ylabel("Taux d'abandon réel (%)", fontsize=11)
+ax.set_title(
+    f"Validation — Taux d'abandon réel par décile\n"
+    f"Weibull AFT, C-index test={c_test:.3f}",
+    fontsize=13, fontweight='bold'
+)
 ax.set_xticks(range(1, 11))
 ax.grid(axis='y', alpha=0.3)
 plt.tight_layout()
@@ -176,41 +227,37 @@ plt.savefig('/home/user/EAuagent/figures/etape8_validation_deciles.png', dpi=150
 plt.close()
 print("Figure sauvegardée : figures/etape8_validation_deciles.png")
 
-# 7c. Courbes de survie prédites pour profils types
+# 10c. Courbes de survie prédites pour profils types
 fig, ax = plt.subplots(figsize=(10, 6))
 
 profiles = {
     'FT ancien (1960), diam 100, anomalies': {
-        'DIAMETRE_imp': 100, 'LNG_log': 3.5, 'DDP_year': 1960,
+        'DIAMETRE_imp': 100, 'LNG_log': 3.5,
         'nb_anomalies': 3, 'nb_fuites_signalees': 2, 'nb_fuites_detectees': 1,
-        'taux_anomalie_par_an': 0.05, 'DT_NB_LOGEMENT_imp': 40,
-        'DT_FLUX_CIRCULATION_imp': 3,
+        'DT_NB_LOGEMENT_imp': 40, 'DT_FLUX_CIRCULATION_imp': 3,
     },
-    'FTG récent (2000), diam 150, sans anomalie': {
-        'DIAMETRE_imp': 150, 'LNG_log': 4.0, 'DDP_year': 2000,
+    'FTG sans anomalie, diam 150': {
+        'DIAMETRE_imp': 150, 'LNG_log': 4.0,
         'nb_anomalies': 0, 'nb_fuites_signalees': 0, 'nb_fuites_detectees': 0,
-        'taux_anomalie_par_an': 0, 'DT_NB_LOGEMENT_imp': 50,
-        'DT_FLUX_CIRCULATION_imp': 2,
+        'DT_NB_LOGEMENT_imp': 50, 'DT_FLUX_CIRCULATION_imp': 2,
     },
-    'PEHD récent (2005), diam 110': {
-        'DIAMETRE_imp': 110, 'LNG_log': 3.0, 'DDP_year': 2005,
+    'PEHD sans anomalie, diam 110': {
+        'DIAMETRE_imp': 110, 'LNG_log': 3.0,
         'nb_anomalies': 0, 'nb_fuites_signalees': 0, 'nb_fuites_detectees': 0,
-        'taux_anomalie_par_an': 0, 'DT_NB_LOGEMENT_imp': 30,
-        'DT_FLUX_CIRCULATION_imp': 3,
+        'DT_NB_LOGEMENT_imp': 30, 'DT_FLUX_CIRCULATION_imp': 3,
     },
-    'FT ancien (1950), diam 80, anomalies multiples': {
-        'DIAMETRE_imp': 80, 'LNG_log': 3.0, 'DDP_year': 1950,
+    'FT anomalies multiples, diam 80': {
+        'DIAMETRE_imp': 80, 'LNG_log': 3.0,
         'nb_anomalies': 5, 'nb_fuites_signalees': 3, 'nb_fuites_detectees': 2,
-        'taux_anomalie_par_an': 0.1, 'DT_NB_LOGEMENT_imp': 60,
-        'DT_FLUX_CIRCULATION_imp': 4,
+        'DT_NB_LOGEMENT_imp': 60, 'DT_FLUX_CIRCULATION_imp': 4,
     },
 }
 
 mat_assignments = {
     'FT ancien (1960), diam 100, anomalies': 'FT',
-    'FTG récent (2000), diam 150, sans anomalie': 'FTG',
-    'PEHD récent (2005), diam 110': 'PEHD',
-    'FT ancien (1950), diam 80, anomalies multiples': 'FT',
+    'FTG sans anomalie, diam 150': 'FTG',
+    'PEHD sans anomalie, diam 110': 'PEHD',
+    'FT anomalies multiples, diam 80': 'FT',
 }
 
 colors_profiles = ['#e74c3c', '#2ecc71', '#3498db', '#e67e22']
@@ -230,7 +277,7 @@ for i, (name, profile) in enumerate(profiles.items()):
 
 ax.set_xlabel('Durée (années)', fontsize=11)
 ax.set_ylabel('S(t) — Probabilité de survie', fontsize=11)
-ax.set_title('Courbes de survie prédites — Profils types\n(Weibull AFT, Dataset B)',
+ax.set_title('Courbes de survie prédites — Profils types\n(Weibull AFT, sans DDP_year)',
              fontsize=13, fontweight='bold')
 ax.legend(fontsize=8, loc='lower left')
 ax.grid(alpha=0.3)
@@ -241,7 +288,7 @@ plt.savefig('/home/user/EAuagent/figures/etape8_profils_survie.png', dpi=150)
 plt.close()
 print("Figure sauvegardée : figures/etape8_profils_survie.png")
 
-# 7d. Carte matériau × décile
+# 10d. Carte matériau × décile
 fig, ax = plt.subplots(figsize=(10, 6))
 mats_main = ['FT', 'FTG', 'POLY', 'PEHD', 'PVC', 'BTM', 'FTVI']
 heatmap_data = []
@@ -253,7 +300,6 @@ for mat in mats_main:
     heatmap_data.append(row)
 
 heatmap_df = pd.DataFrame(heatmap_data, index=mats_main, columns=range(1, 11))
-# Normaliser par matériau (%)
 heatmap_pct = heatmap_df.div(heatmap_df.sum(axis=1), axis=0) * 100
 
 im = ax.imshow(heatmap_pct.values, cmap='RdYlGn_r', aspect='auto')
@@ -263,10 +309,9 @@ ax.set_yticks(range(len(mats_main)))
 ax.set_yticklabels(mats_main)
 ax.set_xlabel('Décile de risque (1=faible, 10=élevé)', fontsize=11)
 ax.set_ylabel('Matériau', fontsize=11)
-ax.set_title('Répartition des tronçons par matériau et décile de risque (%)\n(Weibull AFT)',
+ax.set_title('Répartition des tronçons par matériau et décile de risque (%)\n(Weibull AFT, sans DDP_year)',
              fontsize=12, fontweight='bold')
 
-# Annoter
 for i in range(len(mats_main)):
     for j in range(10):
         val = heatmap_pct.values[i, j]

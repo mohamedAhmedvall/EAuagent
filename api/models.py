@@ -65,11 +65,10 @@ class ScoreRequest(BaseModel):
     MAT_grp: str = Field(..., description="Matériau du tronçon")
     DIAMETRE_imp: float = Field(..., ge=25, le=1000, description="Diamètre (mm)")
     LNG: float = Field(..., gt=0, description="Longueur (m)")
-    DDP_year: int = Field(..., ge=1900, le=2025, description="Année de pose")
+    DDP_year: int = Field(..., ge=1900, le=2025, description="Année de pose (utilisée pour calculer l'âge actuel, pas comme covariable du modèle)")
     nb_anomalies: int = Field(0, ge=0)
     nb_fuites_signalees: int = Field(0, ge=0)
     nb_fuites_detectees: int = Field(0, ge=0)
-    taux_anomalie_par_an: float = Field(0.0, ge=0)
     DT_NB_LOGEMENT_imp: float = Field(40.0, ge=0)
     DT_FLUX_CIRCULATION_imp: float = Field(3.0, ge=0)
 
